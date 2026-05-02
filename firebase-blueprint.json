@@ -1,0 +1,46 @@
+{
+  "entities": {
+    "songs": {
+      "title": "Repertório de Músicas",
+      "description": "Lista de músicas disponíveis para ensaio com áudio hospedado no Storage.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "description": "Título da música" },
+        "author": { "type": "string", "description": "Ministério/Artista" },
+        "thumbnail": { "type": "string", "description": "URL da imagem de capa" },
+        "audioUrl": { "type": "string", "description": "URL do arquivo MP3 no Firebase Storage" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Data de adição" }
+      },
+      "required": ["title", "author", "audioUrl"]
+    },
+    "requests": {
+      "title": "Solicitações de Música",
+      "description": "Links do YouTube enviados pelos músicos para serem adicionados ao repertório.",
+      "type": "object",
+      "properties": {
+        "youtubeUrl": { "type": "string", "description": "Link do vídeo solicitado" },
+        "songTitle": { "type": "string", "description": "Nome da música (opcional)" },
+        "status": { "type": "string", "enum": ["pending", "added"], "description": "Status do pedido" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Data da solicitação" }
+      },
+      "required": ["youtubeUrl", "status"]
+    },
+    "system_logs": {
+      "title": "Logs do Sistema",
+      "description": "Erros e eventos técnicos para diagnóstico do desenvolvedor.",
+      "type": "object",
+      "properties": {
+        "message": { "type": "string" },
+        "error": { "type": "string" },
+        "context": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["message", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/songs": { "schema": "songs", "description": "Coleção principal do repertório" },
+    "/requests": { "schema": "requests", "description": "Fila de pedidos dos músicos" },
+    "/system_logs": { "schema": "system_logs", "description": "Logs para diagnóstico técnico" }
+  }
+}
