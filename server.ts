@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import multer from "multer";
 import fs from "fs";
 import youtubedl from "youtube-dl-exec";
+import ffmpeg from "ffmpeg-static";
 import Replicate from "replicate";
 import "dotenv/config";
 
@@ -73,7 +74,8 @@ async function startServer() {
         output: filepath,
         noWarnings: true,
         noCheckCertificates: true,
-        noPlaylist: true
+        noPlaylist: true,
+        ffmpegLocation: ffmpeg || undefined
       });
 
       console.log(`Upload do YouTube para o Firebase...`);
