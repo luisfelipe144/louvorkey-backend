@@ -3,7 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import fs from "fs";
-import ytdl from "@distube/ytdl-core";
+import play from "play-dl";
 import ffmpeg from "ffmpeg-static";
 import Replicate from "replicate";
 import "dotenv/config";
@@ -68,16 +68,16 @@ async function startServer() {
       const filename = `youtube-${uniqueSuffix}.mp3`;
       const filepath = path.join(__dirname, filename);
 
-      console.log(`Baixando áudio com ytdl-core: ${url}`);
+      console.log(`Baixando áudio com play-dl: ${url}`);
       
-      const stream = ytdl(url, { filter: 'audioonly', quality: 'highestaudio' });
+      const streamInfo = await play.stream(url, { discordPlayerCompatibility: false });
       const writeStream = fs.createWriteStream(filepath);
-      stream.pipe(writeStream);
+      streamInfo.stream.pipe(writeStream);
       
       await new Promise((resolve, reject) => {
           writeStream.on('finish', resolve);
           writeStream.on('error', reject);
-          stream.on('error', reject);
+          streamInfo.stream.on('error', reject);
       });
 
       console.log(`Upload do YouTube para o Firebase...`);
