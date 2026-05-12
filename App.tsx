@@ -37,11 +37,16 @@ export default function App() {
 
   // Audio Engine States
   const soundsRef = useRef<{ [key: string]: Audio.Sound }>({});
+  // URLs originais da música atual (sem pitch shift) — usadas como base para gerar versões pitched
+  const originalUrlsRef = useRef<{ master?: string; stems?: { [key: string]: string } }>({});
+  // Cancela requests de pitch antigas quando o usuário muda rápido
+  const pitchAbortRef = useRef<AbortController | null>(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [position, setPosition] = useState(0);
   const [isSeparating, setIsSeparating] = useState(false);
-  
+  const [isPitchLoading, setIsPitchLoading] = useState(false);
+
   // Mixer States
   const [volumes, setVolumes] = useState<{[key: string]: number}>({
     vocals: 80, drums: 80, bass: 80, guitar: 80, piano: 80, other: 80, master: 100
@@ -78,8 +83,16 @@ export default function App() {
   // 3. Selecionar Música e Carregar Motor de Áudio
   const handleSelectSong = async (song: any) => {
     setSelectedSong(song);
+    setPitch(0); // Sempre começa em C ao trocar música
     await unloadAllSounds();
-    
+
+    // Guarda URLs originais — é a partir delas que geramos versões em outros tons
+    if (song.stems) {
+      originalUrlsRef.current = { stems: { ...song.stems } };
+    } else {
+      originalUrlsRef.current = { master: song.audioUrl };
+    }
+
     try {
       await Audio.setAudioModeAsync({
         playsInSilentModeIOS: true,
@@ -87,47 +100,134 @@ export default function App() {
         shouldDuckAndroid: true,
       });
 
-      if (song.stems) {
-        // Carrega 6 faixas
-        const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
-        for (const key of stemKeys) {
-          let url = song.stems[key];
-          if (!url) continue;
-          if (url.startsWith('/uploads')) url = `${API_URL}${url}`;
-          
-          const { sound } = await Audio.Sound.createAsync({ uri: url });
-          soundsRef.current[key] = sound;
-          
-          // Usa a primeira faixa para rastrear o tempo
-          if (key === 'vocals') {
-            sound.setOnPlaybackStatusUpdate((status: any) => {
-              if (status.isLoaded) {
-                setPosition(status.positionMillis);
-                setDuration(status.durationMillis || 0);
-                if (status.didJustFinish) setPlaying(false);
-              }
-            });
-          }
-        }
-      } else {
-        // Carrega áudio original
-        let url = song.audioUrl;
-        if (url?.startsWith('/uploads')) url = `${API_URL}${url}`;
-        
-        const { sound } = await Audio.Sound.createAsync({ uri: url });
-        soundsRef.current['master'] = sound;
-        sound.setOnPlaybackStatusUpdate((status: any) => {
-          if (status.isLoaded) {
-            setPosition(status.positionMillis);
-            setDuration(status.durationMillis || 0);
-            if (status.didJustFinish) setPlaying(false);
-          }
-        });
-      }
+      await loadSoundsFromUrls(originalUrlsRef.current);
     } catch (e) {
       Alert.alert("Erro", "Falha ao carregar áudio");
       console.error(e);
     }
+  };
+
+  // Carrega Audio.Sound a partir de URLs (ou originais ou pitched).
+  // Não toca em originalUrlsRef — só hidrata o soundsRef.
+  const loadSoundsFromUrls = async (urls: { master?: string; stems?: { [key: string]: string } }) => {
+    if (urls.stems) {
+      const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
+      let trackerKey: string | null = null;
+      for (const key of stemKeys) {
+        let url = urls.stems[key];
+        if (!url) continue;
+        if (url.startsWith('/uploads')) url = `${API_URL}${url}`;
+
+        const { sound } = await Audio.Sound.createAsync({ uri: url });
+        soundsRef.current[key] = sound;
+        await sound.setVolumeAsync(mutes[key] ? 0 : (volumes[key] / 100));
+
+        if (!trackerKey) {
+          trackerKey = key;
+          sound.setOnPlaybackStatusUpdate((status: any) => {
+            if (status.isLoaded) {
+              setPosition(status.positionMillis);
+              setDuration(status.durationMillis || 0);
+              if (status.didJustFinish) setPlaying(false);
+            }
+          });
+        }
+      }
+    } else if (urls.master) {
+      let url = urls.master;
+      if (url.startsWith('/uploads')) url = `${API_URL}${url}`;
+
+      const { sound } = await Audio.Sound.createAsync({ uri: url });
+      soundsRef.current['master'] = sound;
+      await sound.setVolumeAsync(mutes.master ? 0 : (volumes.master / 100));
+      sound.setOnPlaybackStatusUpdate((status: any) => {
+        if (status.isLoaded) {
+          setPosition(status.positionMillis);
+          setDuration(status.durationMillis || 0);
+          if (status.didJustFinish) setPlaying(false);
+        }
+      });
+    }
+  };
+
+  // Aplica pitch shift: chama /api/pitch pra cada URL original e recarrega o player.
+  // Preserva posição e estado de play. Cancela request anterior se usuário mudar rápido.
+  const applyPitch = async (semitones: number) => {
+    pitchAbortRef.current?.abort();
+    const controller = new AbortController();
+    pitchAbortRef.current = controller;
+
+    setIsPitchLoading(true);
+
+    const wasPlaying = playing;
+    const savedPosition = position;
+
+    try {
+      // Pausa antes de descarregar
+      const currentSounds = Object.values(soundsRef.current);
+      if (wasPlaying) {
+        await Promise.all(currentSounds.map(s => s.pauseAsync().catch(() => {})));
+      }
+
+      const orig = originalUrlsRef.current;
+      const pitchOne = async (url: string): Promise<string> => {
+        const res = await fetch(`${API_URL}/api/pitch`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioUrl: url, semitones }),
+          signal: controller.signal,
+        });
+        const body = await res.text();
+        if (!res.ok) {
+          let detail = body;
+          try { detail = JSON.parse(body).details || JSON.parse(body).error || body; } catch {}
+          throw new Error(`Pitch (HTTP ${res.status}): ${detail}`);
+        }
+        return JSON.parse(body).url;
+      };
+
+      let newUrls: { master?: string; stems?: { [key: string]: string } };
+      if (orig.stems) {
+        const entries = await Promise.all(
+          Object.entries(orig.stems).map(async ([k, u]) => [k, await pitchOne(u as string)] as const)
+        );
+        if (controller.signal.aborted) return;
+        newUrls = { stems: Object.fromEntries(entries) };
+      } else if (orig.master) {
+        const url = await pitchOne(orig.master);
+        if (controller.signal.aborted) return;
+        newUrls = { master: url };
+      } else {
+        return;
+      }
+
+      await unloadAllSounds();
+      await loadSoundsFromUrls(newUrls);
+
+      const newSounds = Object.values(soundsRef.current);
+      await Promise.all(newSounds.map(s => s.setPositionAsync(savedPosition).catch(() => {})));
+
+      if (wasPlaying) {
+        await Promise.all(newSounds.map(s => s.playAsync().catch(() => {})));
+        setPlaying(true);
+      }
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        console.error('Pitch error:', e);
+        Alert.alert("Erro no Tom", e.message || String(e));
+      }
+    } finally {
+      if (pitchAbortRef.current === controller) {
+        setIsPitchLoading(false);
+      }
+    }
+  };
+
+  const changePitch = (delta: number) => {
+    const next = Math.max(-12, Math.min(12, pitch + delta));
+    if (next === pitch) return;
+    setPitch(next);
+    applyPitch(next);
   };
 
   const togglePlay = async () => {
@@ -175,9 +275,17 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioUrl: selectedSong.audioUrl })
       });
-      if (!res.ok) throw new Error("Erro na API");
-      
-      const data = await res.json();
+      const body = await res.text();
+      if (!res.ok) {
+        let detail = body;
+        try {
+          const parsed = JSON.parse(body);
+          detail = parsed.details || parsed.error || body;
+        } catch {}
+        throw new Error(`Separação falhou (HTTP ${res.status}): ${detail}`);
+      }
+
+      const data = JSON.parse(body);
       await updateDoc(doc(db, 'songs', selectedSong.id), { stems: data.stems });
       setSelectedSong({ ...selectedSong, stems: data.stems });
       Alert.alert("Sucesso", "Faixas separadas!");
@@ -400,15 +508,22 @@ export default function App() {
               </View>
             </View>
 
-            {/* PITCH CONTROL (UI Only for Native AV currently) */}
+            {/* PITCH CONTROL */}
             <View className="bg-white/5 p-5 rounded-3xl mb-6 border border-white/5 flex-row items-center justify-between">
-              <View>
-                <Text className="text-white font-medium">Tom (Visual)</Text>
-                <Text className="text-white/40 text-xs">C {pitch > 0 ? `+${pitch}` : pitch}</Text>
+              <View className="flex-1">
+                <Text className="text-white font-medium">Tom</Text>
+                <Text className="text-white/40 text-xs">
+                  {isPitchLoading ? 'Aplicando tom...' : `C ${pitch > 0 ? `+${pitch}` : pitch} semitons`}
+                </Text>
               </View>
+              {isPitchLoading && <ActivityIndicator color="#34d399" style={{ marginRight: 8 }} />}
               <View className="flex-row items-center gap-4 bg-black/40 rounded-xl p-1">
-                <TouchableOpacity onPress={() => setPitch(p=>p-1)} className="p-2"><ChevronDown color="white" size={20}/></TouchableOpacity>
-                <TouchableOpacity onPress={() => setPitch(p=>p+1)} className="p-2"><ChevronUp color="white" size={20}/></TouchableOpacity>
+                <TouchableOpacity onPress={() => changePitch(-1)} disabled={isPitchLoading} className="p-2">
+                  <ChevronDown color="white" size={20} opacity={isPitchLoading ? 0.3 : 1}/>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => changePitch(1)} disabled={isPitchLoading} className="p-2">
+                  <ChevronUp color="white" size={20} opacity={isPitchLoading ? 0.3 : 1}/>
+                </TouchableOpacity>
               </View>
             </View>
 

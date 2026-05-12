@@ -24,6 +24,7 @@
     "expo-sharing": "~14.0.8",
     "expo-status-bar": "~3.0.9",
     "express": "^4.21.2",
+    "ffmpeg-static": "^5.3.0",
     "firebase": "^12.10.0",
     "lucide-react": "^0.546.0",
     "lucide-react-native": "^1.11.0",

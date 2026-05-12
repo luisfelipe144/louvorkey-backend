@@ -3,9 +3,17 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import fs from "fs";
+import os from "os";
+import crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import Replicate from "replicate";
 import { v2 as cloudinary } from "cloudinary";
+import ffmpegStatic from "ffmpeg-static";
 import "dotenv/config";
+
+const execFileAsync = promisify(execFile);
+const FFMPEG_PATH = ffmpegStatic as unknown as string;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -171,12 +179,14 @@ async function startServer() {
       });
 
       console.log("Iniciando separação com Demucs (Replicate)... Isso pode levar 1-3 minutos.");
+      // htdemucs_6s separa em 6 faixas (vocals, drums, bass, guitar, piano, other).
+      // O htdemucs padrão só dá 4 (sem guitar/piano), o que quebra o mixer do app.
       const output: any = await replicate.run(
         "cjwbw/demucs:25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953",
         {
           input: {
             audio: audioUrl,
-            model_name: "htdemucs",
+            model_name: "htdemucs_6s",
             output_format: "mp3"
           }
         }
@@ -209,6 +219,80 @@ async function startServer() {
     } catch (err: any) {
       console.error("Erro na separação de stems:", err);
       res.status(500).json({ error: "Erro interno na separação da IA", details: err.message });
+    }
+  });
+
+  // Rota de Pitch Shift — gera uma versão da música em outro tom (semitons).
+  // Usa ffmpeg com asetrate+atempo: muda o tom preservando o tempo (estilo Moises).
+  // Cache idempotente no Cloudinary: mesmo (audioUrl, semitones) reusa o arquivo.
+  app.post("/api/pitch", async (req, res) => {
+    try {
+      const { audioUrl, semitones } = req.body;
+      if (!audioUrl || typeof semitones !== 'number') {
+        return res.status(400).json({ error: "audioUrl (string) e semitones (number) obrigatórios" });
+      }
+      if (semitones === 0) {
+        return res.json({ url: audioUrl, cached: true });
+      }
+      if (semitones < -12 || semitones > 12) {
+        return res.status(400).json({ error: "semitones deve estar entre -12 e +12" });
+      }
+
+      const ratio = Math.pow(2, semitones / 12);
+      const sign = semitones > 0 ? 'p' : 'm';
+      const urlHash = crypto.createHash('sha1').update(audioUrl).digest('hex').slice(0, 12);
+      const publicId = `${urlHash}-${sign}${Math.abs(semitones)}`;
+      const cloudinaryPath = `pitched/${publicId}`;
+
+      // Cache: se já existe, retorna sem reprocessar
+      try {
+        const existing = await cloudinary.api.resource(cloudinaryPath, { resource_type: 'video' });
+        if (existing?.secure_url) {
+          console.log(`[Pitch] cache hit: ${cloudinaryPath}`);
+          return res.json({ url: existing.secure_url, cached: true });
+        }
+      } catch {
+        // Recurso não existe — segue processando
+      }
+
+      console.log(`[Pitch] gerando ${semitones} semitons (ratio ${ratio.toFixed(4)}) para ${audioUrl}`);
+
+      const audioRes = await fetch(audioUrl);
+      if (!audioRes.ok) throw new Error(`Falha ao baixar áudio original: HTTP ${audioRes.status}`);
+      const audioBuf = Buffer.from(await audioRes.arrayBuffer());
+
+      const tmp = os.tmpdir();
+      const uid = crypto.randomUUID();
+      const inputPath = path.join(tmp, `pitch-in-${uid}.mp3`);
+      const outputPath = path.join(tmp, `pitch-out-${uid}.mp3`);
+
+      await fs.promises.writeFile(inputPath, audioBuf);
+
+      try {
+        // asetrate muda pitch+tempo juntos; atempo corrige só o tempo de volta.
+        // Resultado: tom muda, BPM permanece igual.
+        const filter = `asetrate=44100*${ratio},aresample=44100,atempo=${(1 / ratio).toFixed(6)}`;
+        await execFileAsync(FFMPEG_PATH, [
+          '-y',
+          '-i', inputPath,
+          '-af', filter,
+          '-c:a', 'libmp3lame',
+          '-q:a', '4',
+          outputPath,
+        ], { maxBuffer: 64 * 1024 * 1024 });
+
+        const outBuf = await fs.promises.readFile(outputPath);
+        const cloudinaryUrl = await uploadAudioToCloudinary(outBuf, 'pitched', publicId);
+
+        console.log(`[Pitch] gerado: ${cloudinaryUrl}`);
+        res.json({ url: cloudinaryUrl, cached: false });
+      } finally {
+        fs.promises.unlink(inputPath).catch(() => {});
+        fs.promises.unlink(outputPath).catch(() => {});
+      }
+    } catch (error: any) {
+      console.error("Erro no pitch shift:", error);
+      res.status(500).json({ error: "Falha no pitch shift", details: error.message });
     }
   });
 
