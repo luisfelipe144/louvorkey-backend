@@ -10,14 +10,12 @@ import "dotenv/config";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Cloudinary é onde guardamos os áudios agora (substituiu o Firebase Storage,
-// que exige plano Blaze). Credenciais via env: CLOUDINARY_CLOUD_NAME, _API_KEY, _API_SECRET.
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-  secure: true,
-});
+// Cloudinary guarda os áudios (substituiu Firebase Storage que exige plano Blaze).
+// Aceita tanto CLOUDINARY_URL (uma var só) quanto as 3 vars individuais.
+if (!process.env.CLOUDINARY_URL && process.env.CLOUDINARY_CLOUD_NAME) {
+  process.env.CLOUDINARY_URL = `cloudinary://${process.env.CLOUDINARY_API_KEY}:${process.env.CLOUDINARY_API_SECRET}@${process.env.CLOUDINARY_CLOUD_NAME}`;
+}
+cloudinary.config({ secure: true });
 
 // Upload helper: áudio entra como resource_type "video" no Cloudinary.
 async function uploadAudioToCloudinary(
@@ -46,8 +44,8 @@ async function uploadAudioToCloudinary(
 const upload = multer({ storage: multer.memoryStorage() });
 
 async function startServer() {
-  if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
-    console.warn("[AVISO] Variáveis CLOUDINARY_* não configuradas. Os uploads vão falhar até que sejam definidas no Render.");
+  if (!process.env.CLOUDINARY_URL) {
+    console.warn("[AVISO] CLOUDINARY_URL não configurada. Os uploads vão falhar até que seja definida no Render.");
   }
 
   const app = express();
