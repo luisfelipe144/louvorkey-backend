@@ -4,52 +4,73 @@ import { fileURLToPath } from "url";
 import multer from "multer";
 import fs from "fs";
 import Replicate from "replicate";
+import { v2 as cloudinary } from "cloudinary";
 import "dotenv/config";
-
-// Firebase Imports para Node.js
-import { initializeApp } from "firebase/app";
-import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Carregar Configurações do Firebase
-const firebaseConfigPath = path.join(__dirname, 'firebase-applet-config.json');
-const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, 'utf8'));
+// Cloudinary é onde guardamos os áudios agora (substituiu o Firebase Storage,
+// que exige plano Blaze). Credenciais via env: CLOUDINARY_CLOUD_NAME, _API_KEY, _API_SECRET.
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
 
-// Inicializar Firebase no Backend
-const firebaseApp = initializeApp(firebaseConfig);
-const storage = getStorage(firebaseApp);
+// Upload helper: áudio entra como resource_type "video" no Cloudinary.
+async function uploadAudioToCloudinary(
+  buffer: Buffer | Uint8Array,
+  folder: string,
+  publicId?: string
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const opts: any = {
+      resource_type: "video",
+      folder,
+      format: "mp3",
+    };
+    if (publicId) opts.public_id = publicId;
 
-// Configuração do Multer (agora em memória, não salva mais no disco local!)
+    const stream = cloudinary.uploader.upload_stream(opts, (error, result) => {
+      if (error) return reject(error);
+      if (!result?.secure_url) return reject(new Error("Cloudinary não retornou secure_url"));
+      resolve(result.secure_url);
+    });
+    stream.end(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer));
+  });
+}
+
+// Configuração do Multer (memória)
 const upload = multer({ storage: multer.memoryStorage() });
 
 async function startServer() {
+  if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+    console.warn("[AVISO] Variáveis CLOUDINARY_* não configuradas. Os uploads vão falhar até que sejam definidas no Render.");
+  }
+
   const app = express();
   const PORT = 3000;
 
   app.use(express.json());
 
-  // Rota de Upload (Envia direto pro Firebase Storage)
+  // Rota de Upload de arquivo local
   app.post("/api/upload", upload.single("file"), async (req, res) => {
     try {
       const file = (req as any).file;
       if (!file) {
         return res.status(400).json({ error: "Nenhum arquivo enviado" });
       }
-      
-      const uniqueName = `songs/upload-${Date.now()}-${Math.round(Math.random() * 1e9)}.mp3`;
-      const storageRef = ref(storage, uniqueName);
-      
-      console.log(`Fazendo upload para o Firebase: ${uniqueName}`);
-      await uploadBytes(storageRef, new Uint8Array(file.buffer), { contentType: file.mimetype || 'audio/mpeg' });
-      
-      const downloadUrl = await getDownloadURL(storageRef);
-      console.log(`Upload concluído: ${downloadUrl}`);
-      
-      res.json({ url: downloadUrl });
+
+      console.log(`Upload pro Cloudinary: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+      const publicId = `upload-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+      const url = await uploadAudioToCloudinary(file.buffer, "songs", publicId);
+      console.log(`Upload concluído: ${url}`);
+
+      res.json({ url });
     } catch (error: any) {
-      console.error("Erro no upload para Firebase:", error);
+      console.error("Erro no upload pro Cloudinary:", error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -123,16 +144,12 @@ async function startServer() {
 
       const { audioBuffer, filename: cobaltFilename } = await fetchFromCobalt(url);
 
-      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-      const filename = `youtube-${uniqueSuffix}.mp3`;
-      console.log(`Upload pro Firebase: ${filename} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
-
-      const storageRef = ref(storage, `songs/${filename}`);
-      await uploadBytes(storageRef, new Uint8Array(audioBuffer), { contentType: 'audio/mpeg' });
-      const downloadUrl = await getDownloadURL(storageRef);
+      const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+      console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+      const cloudinaryUrl = await uploadAudioToCloudinary(new Uint8Array(audioBuffer), "songs", publicId);
 
       res.json({
-        url: downloadUrl,
+        url: cloudinaryUrl,
         title: cobaltFilename || "Áudio do YouTube",
       });
     } catch (error: any) {
@@ -156,7 +173,6 @@ async function startServer() {
       });
 
       console.log("Iniciando separação com Demucs (Replicate)... Isso pode levar 1-3 minutos.");
-      // O Replicate aceita URLs públicas (Firebase) diretamente!
       const output: any = await replicate.run(
         "cjwbw/demucs:25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953",
         {
@@ -168,25 +184,23 @@ async function startServer() {
         }
       );
 
-      console.log("Separação concluída. Replicate retornou URLs temporárias. Transferindo para o Firebase...");
-      
-      // Replicate retorna URLs que expiram em 1 hora. Temos que salvar no Firebase!
+      console.log("Separação concluída. URLs do Replicate expiram em 1h — transferindo pro Cloudinary...");
+
       const stems: any = {};
       const uniqueSession = Date.now();
-      
       const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
-      
-      // Faz o download e upload em paralelo (para ser mais rápido)
+
       await Promise.all(stemKeys.map(async (key) => {
         if (output[key]) {
           try {
             const stemRes = await fetch(output[key]);
             const stemBuffer = await stemRes.arrayBuffer();
-            
-            const storageRef = ref(storage, `stems/${uniqueSession}-${key}.mp3`);
-            await uploadBytes(storageRef, new Uint8Array(stemBuffer), { contentType: 'audio/mpeg' });
-            stems[key] = await getDownloadURL(storageRef);
-            console.log(`Faixa '${key}' salva no Firebase!`);
+            stems[key] = await uploadAudioToCloudinary(
+              new Uint8Array(stemBuffer),
+              "stems",
+              `${uniqueSession}-${key}`
+            );
+            console.log(`Faixa '${key}' salva no Cloudinary!`);
           } catch (e) {
             console.error(`Erro ao transferir faixa ${key}:`, e);
           }
@@ -200,7 +214,7 @@ async function startServer() {
     }
   });
 
-  // Não precisamos mais servir a pasta /uploads estaticamente, mas deixamos caso haja arquivos velhos
+  // Mantém /uploads estático se houver arquivos antigos no disco
   const uploadDir = path.join(__dirname, "public", "uploads");
   if (fs.existsSync(uploadDir)) {
     app.use("/uploads", express.static(uploadDir));
