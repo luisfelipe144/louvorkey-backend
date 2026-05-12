@@ -45,7 +45,10 @@ export default function App() {
   const [duration, setDuration] = useState(0);
   const [position, setPosition] = useState(0);
   const [isSeparating, setIsSeparating] = useState(false);
+  const [separateStartedAt, setSeparateStartedAt] = useState<number | null>(null);
+  const [separateElapsed, setSeparateElapsed] = useState(0);
   const [isPitchLoading, setIsPitchLoading] = useState(false);
+  const [showPitchPicker, setShowPitchPicker] = useState(false);
 
   // Mixer States
   const [volumes, setVolumes] = useState<{[key: string]: number}>({
@@ -55,6 +58,13 @@ export default function App() {
     vocals: false, drums: false, bass: false, guitar: false, piano: false, other: false, master: false
   });
   const [pitch, setPitch] = useState(0);
+
+  // Tick a cada 1s enquanto está separando — mostra timer decorrido
+  useEffect(() => {
+    if (!separateStartedAt) return;
+    const id = setInterval(() => setSeparateElapsed(Date.now() - separateStartedAt), 1000);
+    return () => clearInterval(id);
+  }, [separateStartedAt]);
 
   // 1. Iniciar Firebase e carregar músicas
   useEffect(() => {
@@ -223,8 +233,9 @@ export default function App() {
     }
   };
 
-  const changePitch = (delta: number) => {
-    const next = Math.max(-12, Math.min(12, pitch + delta));
+  const selectPitch = (semitones: number) => {
+    const next = Math.max(-12, Math.min(12, semitones));
+    setShowPitchPicker(false);
     if (next === pitch) return;
     setPitch(next);
     applyPitch(next);
@@ -269,6 +280,8 @@ export default function App() {
   const handleSeparateStems = async () => {
     if (!selectedSong) return;
     setIsSeparating(true);
+    setSeparateStartedAt(Date.now());
+    setSeparateElapsed(0);
     try {
       const res = await fetch(`${API_URL}/api/separate`, {
         method: 'POST',
@@ -294,6 +307,7 @@ export default function App() {
       Alert.alert("Erro", e.message);
     } finally {
       setIsSeparating(false);
+      setSeparateStartedAt(null);
     }
   };
 
@@ -509,32 +523,52 @@ export default function App() {
             </View>
 
             {/* PITCH CONTROL */}
-            <View className="bg-white/5 p-5 rounded-3xl mb-6 border border-white/5 flex-row items-center justify-between">
+            <TouchableOpacity
+              onPress={() => !isPitchLoading && setShowPitchPicker(true)}
+              disabled={isPitchLoading}
+              className="bg-white/5 p-5 rounded-3xl mb-6 border border-white/5 flex-row items-center justify-between"
+            >
               <View className="flex-1">
                 <Text className="text-white font-medium">Tom</Text>
                 <Text className="text-white/40 text-xs">
-                  {isPitchLoading ? 'Aplicando tom...' : `C ${pitch > 0 ? `+${pitch}` : pitch} semitons`}
+                  {isPitchLoading ? 'Aplicando tom... (10-15s)' : `C ${pitch > 0 ? `+${pitch}` : pitch} semitons — toque para mudar`}
                 </Text>
               </View>
-              {isPitchLoading && <ActivityIndicator color="#34d399" style={{ marginRight: 8 }} />}
-              <View className="flex-row items-center gap-4 bg-black/40 rounded-xl p-1">
-                <TouchableOpacity onPress={() => changePitch(-1)} disabled={isPitchLoading} className="p-2">
-                  <ChevronDown color="white" size={20} opacity={isPitchLoading ? 0.3 : 1}/>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => changePitch(1)} disabled={isPitchLoading} className="p-2">
-                  <ChevronUp color="white" size={20} opacity={isPitchLoading ? 0.3 : 1}/>
-                </TouchableOpacity>
-              </View>
-            </View>
+              {isPitchLoading
+                ? <ActivityIndicator color="#34d399" />
+                : <View className="bg-emerald-500/20 px-3 py-1.5 rounded-lg">
+                    <Text className="text-emerald-400 font-bold">{pitch > 0 ? `+${pitch}` : pitch}</Text>
+                  </View>
+              }
+            </TouchableOpacity>
 
             {/* MIXER */}
             {!selectedSong?.stems ? (
-              <TouchableOpacity 
+              <TouchableOpacity
                 onPress={handleSeparateStems} disabled={isSeparating}
-                className="bg-emerald-500/10 border border-emerald-500/20 p-5 rounded-3xl items-center justify-center flex-row gap-3"
+                className="bg-emerald-500/10 border border-emerald-500/20 p-5 rounded-3xl items-center justify-center"
               >
-                {isSeparating ? <ActivityIndicator color="#34d399" /> : <Music color="#34d399" size={20} />}
-                <Text className="text-emerald-400 font-semibold">{isSeparating ? 'Separando IA (2 min)...' : 'Separar 6 Faixas com IA'}</Text>
+                {isSeparating ? (
+                  <View className="items-center gap-2">
+                    <View className="flex-row items-center gap-3">
+                      <ActivityIndicator color="#34d399" />
+                      <Text className="text-emerald-400 font-semibold">
+                        Separando faixas com IA...
+                      </Text>
+                    </View>
+                    <Text className="text-white/50 text-xs">
+                      {formatTime(separateElapsed)} decorridos · espera entre 2-4 min
+                    </Text>
+                    <Text className="text-white/30 text-[10px]">
+                      Não feche o app · Demucs rodando em GPU
+                    </Text>
+                  </View>
+                ) : (
+                  <View className="flex-row items-center gap-3">
+                    <Music color="#34d399" size={20} />
+                    <Text className="text-emerald-400 font-semibold">Separar 6 Faixas com IA</Text>
+                  </View>
+                )}
               </TouchableOpacity>
             ) : (
               <View className="bg-black/40 border border-white/5 rounded-3xl p-5 mb-8">
@@ -568,6 +602,50 @@ export default function App() {
               </View>
             )}
           </ScrollView>
+        </View>
+      </Modal>
+
+      {/* PITCH PICKER MODAL */}
+      <Modal visible={showPitchPicker} animationType="fade" transparent onRequestClose={() => setShowPitchPicker(false)}>
+        <View className="flex-1 bg-black/80 justify-center items-center p-6">
+          <View className="bg-[#121212] w-full max-w-sm rounded-3xl p-6 border border-white/10">
+            <View className="flex-row justify-between items-center mb-4">
+              <Text className="text-white font-semibold text-xl">Escolha o tom</Text>
+              <TouchableOpacity onPress={() => setShowPitchPicker(false)}>
+                <X color="white" size={24} opacity={0.5}/>
+              </TouchableOpacity>
+            </View>
+            <Text className="text-white/40 text-xs mb-5">
+              Versões já geradas tocam na hora. Tons novos demoram ~10-15s pra serem processados pela primeira vez.
+            </Text>
+
+            <View className="flex-row flex-wrap justify-center gap-2">
+              {Array.from({ length: 13 }, (_, i) => i - 6).map((semitones) => {
+                const isCurrent = semitones === pitch;
+                const label = semitones === 0 ? 'C' : (semitones > 0 ? `+${semitones}` : `${semitones}`);
+                return (
+                  <TouchableOpacity
+                    key={semitones}
+                    onPress={() => selectPitch(semitones)}
+                    className={`w-16 h-14 rounded-2xl items-center justify-center border ${
+                      isCurrent
+                        ? 'bg-emerald-500 border-emerald-400'
+                        : 'bg-white/5 border-white/10'
+                    }`}
+                  >
+                    <Text className={`font-bold text-lg ${isCurrent ? 'text-white' : 'text-white/80'}`}>
+                      {label}
+                    </Text>
+                    {semitones === 0 && (
+                      <Text className={`text-[10px] ${isCurrent ? 'text-white/80' : 'text-white/40'}`}>
+                        original
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
         </View>
       </Modal>
 
