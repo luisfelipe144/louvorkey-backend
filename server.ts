@@ -237,8 +237,16 @@ async function startServer() {
     }
   });
 
-  // Rota para separar instrumentos (Moises Clone via Replicate Demucs)
-  app.post("/api/separate", async (req, res) => {
+  // Separação de stems: padrão assíncrono pra não estourar o timeout do Render Free.
+  // POST /api/separate/start  → cria predição no Replicate, retorna jobId imediatamente
+  // GET  /api/separate/status/:jobId  → consulta status; quando 'succeeded', transfere
+  //                                     stems pro Cloudinary e retorna URLs (cacheado).
+
+  // Cache de stems já transferidos pro Cloudinary, indexado por prediction id.
+  // Sobrevive enquanto o processo Node viver. Se cair, o app só precisa pedir de novo.
+  const stemsCache = new Map<string, { [key: string]: string }>();
+
+  app.post("/api/separate/start", async (req, res) => {
     try {
       const { audioUrl } = req.body;
       if (!audioUrl) return res.status(400).json({ error: "Áudio não fornecido" });
@@ -247,32 +255,61 @@ async function startServer() {
         return res.status(500).json({ error: "Token da Replicate ausente no .env" });
       }
 
-      const replicate = new Replicate({
-        auth: process.env.REPLICATE_API_TOKEN,
+      const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+
+      console.log(`[separate] criando predição Demucs htdemucs_6s para ${audioUrl}`);
+      const prediction = await replicate.predictions.create({
+        version: "25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953",
+        input: {
+          audio: audioUrl,
+          model_name: "htdemucs_6s",
+          output_format: "mp3",
+        },
       });
 
-      console.log("Iniciando separação com Demucs (Replicate)... Isso pode levar 1-3 minutos.");
-      // htdemucs_6s separa em 6 faixas (vocals, drums, bass, guitar, piano, other).
-      // O htdemucs padrão só dá 4 (sem guitar/piano), o que quebra o mixer do app.
-      const output: any = await replicate.run(
-        "cjwbw/demucs:25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953",
-        {
-          input: {
-            audio: audioUrl,
-            model_name: "htdemucs_6s",
-            output_format: "mp3"
-          }
-        }
-      );
+      console.log(`[separate] prediction iniciada: ${prediction.id}`);
+      res.json({ jobId: prediction.id });
+    } catch (err: any) {
+      console.error("Erro ao iniciar separação:", err);
+      res.status(500).json({ error: "Erro ao iniciar separação", details: err.message });
+    }
+  });
 
-      console.log("Separação concluída. URLs do Replicate expiram em 1h — transferindo pro Cloudinary...");
+  app.get("/api/separate/status/:jobId", async (req, res) => {
+    try {
+      const { jobId } = req.params;
+      if (!jobId) return res.status(400).json({ error: "jobId obrigatório" });
 
-      const stems: any = {};
-      const uniqueSession = Date.now();
+      // Cache hit: stems já foram transferidos antes
+      if (stemsCache.has(jobId)) {
+        return res.json({ status: 'succeeded', stems: stemsCache.get(jobId) });
+      }
+
+      if (!process.env.REPLICATE_API_TOKEN) {
+        return res.status(500).json({ error: "Token da Replicate ausente no .env" });
+      }
+
+      const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN });
+      const prediction = await replicate.predictions.get(jobId);
+
+      if (prediction.status === 'failed' || prediction.status === 'canceled') {
+        return res.json({ status: prediction.status, error: prediction.error });
+      }
+
+      if (prediction.status !== 'succeeded') {
+        // starting | processing — ainda rodando
+        return res.json({ status: prediction.status });
+      }
+
+      // Succeeded — transferir stems pro Cloudinary
+      const output: any = prediction.output;
+      const stems: { [key: string]: string } = {};
+      const uniqueSession = jobId.slice(0, 8);
       const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
 
+      console.log(`[separate] ${jobId} succeeded, transferindo ${stemKeys.length} stems pro Cloudinary...`);
       await Promise.all(stemKeys.map(async (key) => {
-        if (output[key]) {
+        if (output?.[key]) {
           try {
             const stemRes = await fetch(output[key]);
             const stemBuffer = await stemRes.arrayBuffer();
@@ -281,17 +318,18 @@ async function startServer() {
               "stems",
               `${uniqueSession}-${key}`
             );
-            console.log(`Faixa '${key}' salva no Cloudinary!`);
           } catch (e) {
             console.error(`Erro ao transferir faixa ${key}:`, e);
           }
         }
       }));
 
-      res.json({ stems });
+      stemsCache.set(jobId, stems);
+      console.log(`[separate] ${jobId} transferido (${Object.keys(stems).length} stems)`);
+      res.json({ status: 'succeeded', stems });
     } catch (err: any) {
-      console.error("Erro na separação de stems:", err);
-      res.status(500).json({ error: "Erro interno na separação da IA", details: err.message });
+      console.error("Erro no status da separação:", err);
+      res.status(500).json({ error: "Erro no status", details: err.message });
     }
   });
 
@@ -342,9 +380,12 @@ async function startServer() {
       await fs.promises.writeFile(inputPath, audioBuf);
 
       try {
-        // asetrate muda pitch+tempo juntos; atempo corrige só o tempo de volta.
-        // Resultado: tom muda, BPM permanece igual.
-        const filter = `asetrate=44100*${ratio},aresample=44100,atempo=${(1 / ratio).toFixed(6)}`;
+        // Rubberband: pitch shift de qualidade profissional, preserva formantes
+        // (vozes femininas não viram masculinas, instrumentos não somem).
+        // - formant=preserved: mantém timbre vocal
+        // - pitchq=quality: prioriza qualidade sobre velocidade
+        // - channels=together: preserva imagem estéreo
+        const filter = `rubberband=pitch=${ratio.toFixed(6)}:formant=preserved:pitchq=quality:channels=together`;
         await execFileAsync(FFMPEG_PATH, [
           '-y',
           '-i', inputPath,

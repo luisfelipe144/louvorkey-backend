@@ -308,33 +308,66 @@ export default function App() {
     }
   };
 
-  // 4. Inteligência Artificial: Separar Stems
+  // 4. IA: Separar Stems (padrão assíncrono — evita HTTP 502 do Render Free).
+  // Inicia a predição no servidor (~5s) e fica fazendo polling de status (~5s cada)
+  // até succeed. Cada HTTP call é curta, então não estoura timeout do Render.
   const handleSeparateStems = async () => {
     if (!selectedSong) return;
     setIsSeparating(true);
     setSeparateStartedAt(Date.now());
     setSeparateElapsed(0);
+
+    const parseError = async (res: Response, defaultMsg: string) => {
+      const body = await res.text();
+      let detail = body;
+      try {
+        const parsed = JSON.parse(body);
+        detail = parsed.details || parsed.error || body;
+      } catch {}
+      return `${defaultMsg} (HTTP ${res.status}): ${detail}`;
+    };
+
     try {
-      const res = await fetch(`${API_URL}/api/separate`, {
+      // 1) Start
+      const startRes = await fetch(`${API_URL}/api/separate/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioUrl: selectedSong.audioUrl })
       });
-      const body = await res.text();
-      if (!res.ok) {
-        let detail = body;
-        try {
-          const parsed = JSON.parse(body);
-          detail = parsed.details || parsed.error || body;
-        } catch {}
-        throw new Error(`Separação falhou (HTTP ${res.status}): ${detail}`);
+      if (!startRes.ok) throw new Error(await parseError(startRes, 'Falha ao iniciar separação'));
+      const { jobId } = await startRes.json();
+      if (!jobId) throw new Error("Servidor não retornou jobId");
+
+      // 2) Poll de status a cada 5s, até succeeded/failed ou 10 min de timeout
+      const MAX_ATTEMPTS = 120; // 120 × 5s = 10 min
+      let stems: any = null;
+      for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+
+        const statusRes = await fetch(`${API_URL}/api/separate/status/${jobId}`);
+        if (!statusRes.ok) {
+          // Erro transitório — tenta de novo no próximo ciclo
+          console.log(`Status poll ${i} retornou ${statusRes.status}, tentando de novo...`);
+          continue;
+        }
+
+        const data = await statusRes.json();
+        if (data.status === 'succeeded') {
+          stems = data.stems;
+          break;
+        }
+        if (data.status === 'failed' || data.status === 'canceled') {
+          throw new Error(`Demucs ${data.status}: ${data.error || 'erro desconhecido'}`);
+        }
+        // starting / processing — continua polling
       }
 
-      const data = JSON.parse(body);
-      await updateDoc(doc(db, 'songs', selectedSong.id), { stems: data.stems });
-      setSelectedSong({ ...selectedSong, stems: data.stems });
+      if (!stems) throw new Error("Timeout: separação demorou mais de 10 minutos");
+
+      await updateDoc(doc(db, 'songs', selectedSong.id), { stems });
+      setSelectedSong({ ...selectedSong, stems });
       Alert.alert("Sucesso", "Faixas separadas!");
-      await handleSelectSong({ ...selectedSong, stems: data.stems }); // Recarrega com stems
+      await handleSelectSong({ ...selectedSong, stems }); // Recarrega com stems
     } catch (e: any) {
       Alert.alert("Erro", e.message);
     } finally {
