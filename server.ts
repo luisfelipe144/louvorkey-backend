@@ -64,7 +64,7 @@ async function startServer() {
 
       // Instância Cobalt configurável. Se uma cair, troque COBALT_API_URL no .env.
       // Lista de instâncias ativas: https://instances.hyper.lol/
-      const COBALT_API_URL = process.env.COBALT_API_URL || 'https://cobalt-api.kwiatekmiki.com';
+      const COBALT_API_URL = process.env.COBALT_API_URL || 'https://dwnld.nichind.dev';
       console.log(`Solicitando download via Cobalt (${COBALT_API_URL}): ${url}`);
 
       const cobaltRes = await fetch(COBALT_API_URL, {
