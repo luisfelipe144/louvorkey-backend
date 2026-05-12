@@ -18,8 +18,8 @@ import { db } from './firebase';
 import { collection, onSnapshot, query, orderBy, addDoc, updateDoc, doc, serverTimestamp, deleteDoc } from 'firebase/firestore';
 import './global.css';
 
-// Substitua pelo IP da sua máquina ou URL do backend no Render
-const API_URL = 'http://192.168.3.7:3000'; 
+// URL de Produção na Nuvem (Render)
+const API_URL = 'https://louvorkey-backend.onrender.com'; 
 
 export default function App() {
   const [songs, setSongs] = useState<any[]>([]);
@@ -204,28 +204,42 @@ export default function App() {
     try {
       let downloadUrl = '';
       if (addMode === 'youtube') {
+        if (!newYoutubeUrl) throw new Error("Cole o link do YouTube");
         const res = await fetch(`${API_URL}/api/youtube`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: newYoutubeUrl })
         });
-        if (!res.ok) throw new Error("Falha no YouTube");
-        downloadUrl = (await res.json()).url;
+        const rawBody = await res.text();
+        if (!res.ok) {
+          let detail = rawBody;
+          try {
+            const parsed = JSON.parse(rawBody);
+            detail = parsed.details || parsed.error || rawBody;
+          } catch {}
+          throw new Error(`YouTube falhou (HTTP ${res.status}): ${detail}`);
+        }
+        downloadUrl = JSON.parse(rawBody).url;
       } else {
         if (!newFile) throw new Error("Selecione um arquivo");
-        const formData = new FormData();
-        formData.append('file', {
-          uri: newFile.uri,
-          name: newFile.name,
-          type: newFile.mimeType || 'audio/mpeg'
-        } as any);
-        
-        const res = await fetch(`${API_URL}/api/upload`, {
-          method: 'POST',
-          body: formData
+        const res = await FileSystem.uploadAsync(`${API_URL}/api/upload`, newFile.uri, {
+          httpMethod: 'POST',
+          uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+          fieldName: 'file',
+          mimeType: newFile.mimeType || 'audio/mpeg',
         });
-        if (!res.ok) throw new Error("Falha no upload");
-        downloadUrl = (await res.json()).url;
+
+        if (res.status !== 200) {
+          let detail = res.body;
+          try {
+            const parsed = JSON.parse(res.body);
+            detail = parsed.error || parsed.details || res.body;
+          } catch {}
+          throw new Error(`Upload falhou (HTTP ${res.status}): ${detail?.slice?.(0, 300) || detail}`);
+        }
+        const data = JSON.parse(res.body);
+        if (!data.url) throw new Error("Servidor não retornou URL do arquivo");
+        downloadUrl = data.url;
       }
 
       await addDoc(collection(db, 'songs'), {

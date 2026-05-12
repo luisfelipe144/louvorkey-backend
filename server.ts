@@ -3,8 +3,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import fs from "fs";
-import play from "play-dl";
-import ffmpeg from "ffmpeg-static";
 import Replicate from "replicate";
 import "dotenv/config";
 
@@ -56,7 +54,7 @@ async function startServer() {
     }
   });
 
-  // Rota de Download do YouTube
+  // Rota de Download do YouTube (via Cobalt API — contorna o bloqueio de IPs de datacenter)
   app.post("/api/youtube", async (req, res) => {
     try {
       const { url } = req.body;
@@ -64,35 +62,53 @@ async function startServer() {
         return res.status(400).json({ error: "URL do YouTube inválida ou não fornecida" });
       }
 
-      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-      const filename = `youtube-${uniqueSuffix}.mp3`;
-      const filepath = path.join(__dirname, filename);
+      // Instância Cobalt configurável. Se uma cair, troque COBALT_API_URL no .env.
+      // Lista de instâncias ativas: https://instances.hyper.lol/
+      const COBALT_API_URL = process.env.COBALT_API_URL || 'https://cobalt-api.kwiatekmiki.com';
+      console.log(`Solicitando download via Cobalt (${COBALT_API_URL}): ${url}`);
 
-      console.log(`Baixando áudio com play-dl: ${url}`);
-      
-      const streamInfo = await play.stream(url, { discordPlayerCompatibility: false });
-      const writeStream = fs.createWriteStream(filepath);
-      streamInfo.stream.pipe(writeStream);
-      
-      await new Promise((resolve, reject) => {
-          writeStream.on('finish', resolve);
-          writeStream.on('error', reject);
-          streamInfo.stream.on('error', reject);
+      const cobaltRes = await fetch(COBALT_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({
+          url,
+          downloadMode: 'audio',
+          audioFormat: 'mp3',
+          filenameStyle: 'basic',
+        }),
       });
 
-      console.log(`Upload do YouTube para o Firebase...`);
-      const buffer = await fs.promises.readFile(filepath);
-      const storageRef = ref(storage, `songs/${filename}`);
-      
-      await uploadBytes(storageRef, new Uint8Array(buffer), { contentType: 'audio/mpeg' });
-      const downloadUrl = await getDownloadURL(storageRef);
-      
-      // Apaga o arquivo temporário
-      await fs.promises.unlink(filepath);
+      if (!cobaltRes.ok) {
+        const errText = await cobaltRes.text();
+        throw new Error(`Cobalt HTTP ${cobaltRes.status}: ${errText.slice(0, 300)}`);
+      }
 
-      res.json({ 
-        url: downloadUrl, 
-        title: "Áudio do YouTube" 
+      const cobaltData: any = await cobaltRes.json();
+      if (cobaltData.status === 'error' || !cobaltData.url) {
+        throw new Error(`Cobalt retornou erro: ${cobaltData.error?.code || cobaltData.text || JSON.stringify(cobaltData)}`);
+      }
+
+      console.log(`Baixando áudio (status=${cobaltData.status})...`);
+      const audioRes = await fetch(cobaltData.url);
+      if (!audioRes.ok) {
+        throw new Error(`Falha ao baixar do Cobalt tunnel: HTTP ${audioRes.status}`);
+      }
+      const audioBuffer = await audioRes.arrayBuffer();
+
+      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+      const filename = `youtube-${uniqueSuffix}.mp3`;
+
+      console.log(`Upload pro Firebase Storage: ${filename} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+      const storageRef = ref(storage, `songs/${filename}`);
+      await uploadBytes(storageRef, new Uint8Array(audioBuffer), { contentType: 'audio/mpeg' });
+      const downloadUrl = await getDownloadURL(storageRef);
+
+      res.json({
+        url: downloadUrl,
+        title: cobaltData.filename || "Áudio do YouTube",
       });
     } catch (error: any) {
       console.error("Erro no download do YouTube:", error);
