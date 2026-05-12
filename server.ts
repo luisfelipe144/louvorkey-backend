@@ -27,8 +27,9 @@ async function getEssentia(): Promise<any> {
   return essentiaInstance;
 }
 
-// Decodifica MP3 -> mono PCM float32 22050Hz via ffmpeg.
-async function decodeMp3ToFloat32(audioBuffer: Buffer): Promise<Float32Array> {
+// Decodifica MP3 -> mono PCM float32 via ffmpeg. Sample rate default 22050,
+// passa 44100 quando precisa de precisão temporal (ex: posicionamento de beats).
+async function decodeMp3ToFloat32(audioBuffer: Buffer, sampleRate = 22050): Promise<Float32Array> {
   const uid = crypto.randomUUID();
   const tmpIn = path.join(os.tmpdir(), `dec-in-${uid}.mp3`);
   const tmpOut = path.join(os.tmpdir(), `dec-out-${uid}.pcm`);
@@ -37,7 +38,7 @@ async function decodeMp3ToFloat32(audioBuffer: Buffer): Promise<Float32Array> {
     await execFileAsync(FFMPEG_PATH, [
       '-y', '-i', tmpIn,
       '-ac', '1',
-      '-ar', '22050',
+      '-ar', String(sampleRate),
       '-f', 'f32le',
       tmpOut,
     ], { maxBuffer: 200 * 1024 * 1024 });
@@ -49,25 +50,113 @@ async function decodeMp3ToFloat32(audioBuffer: Buffer): Promise<Float32Array> {
   }
 }
 
-// Detecta o tom (key + scale) do áudio. Retorna null em caso de erro.
-async function detectKey(audioBuffer: Buffer): Promise<{ key: string; scale: string; strength: number } | null> {
+// Detecta tom (key + scale) E ritmo (BPM + posições dos beats) num único decode.
+// Retorna null em caso de erro. ticks são posições dos beats em segundos.
+async function analyzeAudio(audioBuffer: Buffer): Promise<{
+  key: string;
+  scale: string;
+  bpm: number;
+  ticks: number[];
+  durationS: number;
+} | null> {
   try {
-    console.log('[detectKey] decodificando MP3...');
-    const pcm = await decodeMp3ToFloat32(audioBuffer);
-    console.log(`[detectKey] PCM ${pcm.length} samples (${(pcm.length / 22050).toFixed(1)}s), rodando KeyExtractor...`);
+    console.log('[analyze] decodificando MP3...');
+    // Sample rate 44100 (em vez de 22050) pra precisão temporal dos ticks
+    const pcm = await decodeMp3ToFloat32(audioBuffer, 44100);
+    const durationS = pcm.length / 44100;
+    console.log(`[analyze] PCM ${pcm.length} samples (${durationS.toFixed(1)}s)`);
 
     const essentia = await getEssentia();
     const vec = essentia.arrayToVector(pcm);
     try {
-      const result = essentia.KeyExtractor(vec);
-      console.log(`[detectKey] resultado: ${result.key} ${result.scale} (strength=${result.strength?.toFixed(3)})`);
-      return { key: result.key, scale: result.scale, strength: result.strength };
+      const keyResult = essentia.KeyExtractor(vec);
+      console.log(`[analyze] tom: ${keyResult.key} ${keyResult.scale}`);
+
+      const rhythmResult = essentia.RhythmExtractor2013(vec);
+      const ticksRaw = rhythmResult.ticks;
+      const ticks: number[] = [];
+      if (ticksRaw && typeof ticksRaw.size === 'function') {
+        const n = ticksRaw.size();
+        for (let i = 0; i < n; i++) ticks.push(ticksRaw.get(i));
+        ticksRaw.delete?.();
+      } else if (Array.isArray(ticksRaw)) {
+        ticks.push(...ticksRaw);
+      }
+      console.log(`[analyze] BPM: ${rhythmResult.bpm?.toFixed(1)}, ${ticks.length} beats`);
+
+      return {
+        key: keyResult.key,
+        scale: keyResult.scale,
+        bpm: rhythmResult.bpm,
+        ticks,
+        durationS,
+      };
     } finally {
       vec.delete?.();
     }
   } catch (e: any) {
-    console.error('[detectKey] Erro:', e.message);
+    console.error('[analyze] Erro:', e.message);
     return null;
+  }
+}
+
+// Gera um sample de click: sine wave com decay exponencial.
+function generateClick(sampleRate: number, freq: number, amp: number, durationMs = 50): Float32Array {
+  const samples = Math.floor((durationMs / 1000) * sampleRate);
+  const click = new Float32Array(samples);
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const envelope = Math.exp(-t * 30);
+    click[i] = Math.sin(2 * Math.PI * freq * t) * envelope * amp;
+  }
+  return click;
+}
+
+// Constrói buffer PCM com clicks nas posições exatas dos beats.
+// A cada 4 beats faz downbeat (mais agudo + alto) — acento de compasso 4/4.
+function buildMetronomeBuffer(beatTimes: number[], durationS: number, sampleRate = 44100): Float32Array {
+  const totalSamples = Math.floor(durationS * sampleRate);
+  const buffer = new Float32Array(totalSamples);
+  const tick = generateClick(sampleRate, 1000, 0.5);
+  const downbeat = generateClick(sampleRate, 1500, 0.7);
+
+  for (let i = 0; i < beatTimes.length; i++) {
+    const isDownbeat = i % 4 === 0;
+    const c = isDownbeat ? downbeat : tick;
+    const startSample = Math.floor(beatTimes[i] * sampleRate);
+    for (let j = 0; j < c.length && startSample + j < totalSamples; j++) {
+      buffer[startSample + j] += c[j];
+    }
+  }
+  // Clip pra evitar saturação se clicks se sobrepuserem
+  for (let i = 0; i < buffer.length; i++) {
+    if (buffer[i] > 1) buffer[i] = 1;
+    else if (buffer[i] < -1) buffer[i] = -1;
+  }
+  return buffer;
+}
+
+// Encoda PCM mono f32 em MP3 via ffmpeg.
+async function pcmToMp3(pcm: Float32Array, sampleRate = 44100): Promise<Buffer> {
+  const uid = crypto.randomUUID();
+  const tmpPcm = path.join(os.tmpdir(), `m-${uid}.pcm`);
+  const tmpMp3 = path.join(os.tmpdir(), `m-${uid}.mp3`);
+  await fs.promises.writeFile(tmpPcm, Buffer.from(pcm.buffer));
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y',
+      '-f', 'f32le',
+      '-ar', String(sampleRate),
+      '-ac', '1',
+      '-i', tmpPcm,
+      '-c:a', 'libmp3lame',
+      '-q:a', '4',
+      tmpMp3,
+    ], { maxBuffer: 64 * 1024 * 1024 });
+    return await fs.promises.readFile(tmpMp3);
+  } finally {
+    fs.promises.unlink(tmpPcm).catch(() => {});
+    fs.promises.unlink(tmpMp3).catch(() => {});
   }
 }
 
@@ -117,6 +206,39 @@ async function startServer() {
 
   app.use(express.json());
 
+  // Helper: pipeline completo de processamento — upload + análise + metrônomo.
+  // Tudo em paralelo onde possível.
+  async function processAndUploadAudio(audioBuf: Buffer, folder: string, publicId: string) {
+    const [url, analysis] = await Promise.all([
+      uploadAudioToCloudinary(audioBuf, folder, publicId),
+      analyzeAudio(audioBuf),
+    ]);
+
+    let metronomeUrl: string | null = null;
+    let bpm: number | null = null;
+    if (analysis && analysis.ticks.length > 4) {
+      try {
+        console.log(`[metronome] gerando ${analysis.ticks.length} clicks (BPM=${analysis.bpm.toFixed(1)})...`);
+        const metroPcm = buildMetronomeBuffer(analysis.ticks, analysis.durationS);
+        const metroMp3 = await pcmToMp3(metroPcm);
+        metronomeUrl = await uploadAudioToCloudinary(metroMp3, 'metronomes', `${publicId}-metro`);
+        bpm = analysis.bpm;
+        console.log(`[metronome] pronto: ${metronomeUrl}`);
+      } catch (e: any) {
+        console.error('[metronome] erro (não-fatal):', e.message);
+      }
+    }
+
+    return {
+      url,
+      originalKey: analysis?.key ?? null,
+      originalScale: analysis?.scale ?? null,
+      bpm,
+      metronomeUrl,
+      durationS: analysis?.durationS ?? null,
+    };
+  }
+
   // Rota de Upload de arquivo local
   app.post("/api/upload", upload.single("file"), async (req, res) => {
     try {
@@ -127,19 +249,9 @@ async function startServer() {
 
       console.log(`Upload pro Cloudinary: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
       const publicId = `upload-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-
-      // Roda upload e detecção de tom em paralelo
-      const [url, detection] = await Promise.all([
-        uploadAudioToCloudinary(file.buffer, "songs", publicId),
-        detectKey(file.buffer),
-      ]);
-      console.log(`Upload concluído: ${url} | tom: ${detection?.key ?? '?'} ${detection?.scale ?? ''}`);
-
-      res.json({
-        url,
-        originalKey: detection?.key ?? null,
-        originalScale: detection?.scale ?? null,
-      });
+      const result = await processAndUploadAudio(file.buffer, "songs", publicId);
+      console.log(`Upload concluído: ${result.url} | tom: ${result.originalKey} ${result.originalScale} | BPM: ${result.bpm?.toFixed(1) ?? '?'}`);
+      res.json(result);
     } catch (error: any) {
       console.error("Erro no upload pro Cloudinary:", error);
       res.status(500).json({ error: error.message });
@@ -218,18 +330,12 @@ async function startServer() {
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
       console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
-
-      const [cloudinaryUrl, detection] = await Promise.all([
-        uploadAudioToCloudinary(audioBuf, "songs", publicId),
-        detectKey(audioBuf),
-      ]);
-      console.log(`YouTube concluído: ${cloudinaryUrl} | tom: ${detection?.key ?? '?'} ${detection?.scale ?? ''}`);
+      const result = await processAndUploadAudio(audioBuf, "songs", publicId);
+      console.log(`YouTube concluído: ${result.url} | tom: ${result.originalKey} | BPM: ${result.bpm?.toFixed(1) ?? '?'}`);
 
       res.json({
-        url: cloudinaryUrl,
+        ...result,
         title: cobaltFilename || "Áudio do YouTube",
-        originalKey: detection?.key ?? null,
-        originalScale: detection?.scale ?? null,
       });
     } catch (error: any) {
       console.error("Erro no download do YouTube:", error);

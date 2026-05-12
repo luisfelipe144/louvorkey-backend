@@ -38,7 +38,7 @@ export default function App() {
   // Audio Engine States
   const soundsRef = useRef<{ [key: string]: Audio.Sound }>({});
   // URLs originais da música atual (sem pitch shift) — usadas como base para gerar versões pitched
-  const originalUrlsRef = useRef<{ master?: string; stems?: { [key: string]: string } }>({});
+  const originalUrlsRef = useRef<{ master?: string; stems?: { [key: string]: string }; metronome?: string }>({});
   // Cancela requests de pitch antigas quando o usuário muda rápido
   const pitchAbortRef = useRef<AbortController | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -53,10 +53,10 @@ export default function App() {
 
   // Mixer States
   const [volumes, setVolumes] = useState<{[key: string]: number}>({
-    vocals: 80, drums: 80, bass: 80, guitar: 80, piano: 80, other: 80, master: 100
+    vocals: 80, drums: 80, bass: 80, guitar: 80, piano: 80, other: 80, metronome: 0, master: 100
   });
   const [mutes, setMutes] = useState<{[key: string]: boolean}>({
-    vocals: false, drums: false, bass: false, guitar: false, piano: false, other: false, master: false
+    vocals: false, drums: false, bass: false, guitar: false, piano: false, other: false, metronome: true, master: false
   });
   const [pitch, setPitch] = useState(0);
 
@@ -136,9 +136,9 @@ export default function App() {
 
     // Guarda URLs originais — é a partir delas que geramos versões em outros tons
     if (song.stems) {
-      originalUrlsRef.current = { stems: { ...song.stems } };
+      originalUrlsRef.current = { stems: { ...song.stems }, metronome: song.metronomeUrl };
     } else {
-      originalUrlsRef.current = { master: song.audioUrl };
+      originalUrlsRef.current = { master: song.audioUrl, metronome: song.metronomeUrl };
     }
 
     try {
@@ -157,7 +157,7 @@ export default function App() {
 
   // Carrega Audio.Sound a partir de URLs (ou originais ou pitched).
   // Não toca em originalUrlsRef — só hidrata o soundsRef.
-  const loadSoundsFromUrls = async (urls: { master?: string; stems?: { [key: string]: string } }) => {
+  const loadSoundsFromUrls = async (urls: { master?: string; stems?: { [key: string]: string }; metronome?: string }) => {
     if (urls.stems) {
       const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
       let trackerKey: string | null = null;
@@ -195,6 +195,17 @@ export default function App() {
           if (status.didJustFinish) setPlaying(false);
         }
       });
+    }
+
+    // Metrônomo (faixa extra independente — carrega se disponível e adiciona ao soundsRef)
+    if (urls.metronome) {
+      try {
+        const { sound: metroSound } = await Audio.Sound.createAsync({ uri: urls.metronome });
+        soundsRef.current['metronome'] = metroSound;
+        await metroSound.setVolumeAsync(mutes.metronome ? 0 : (volumes.metronome / 100));
+      } catch (e) {
+        console.log('Não foi possível carregar metrônomo:', e);
+      }
     }
   };
 
@@ -234,17 +245,17 @@ export default function App() {
         return JSON.parse(body).url;
       };
 
-      let newUrls: { master?: string; stems?: { [key: string]: string } };
+      let newUrls: { master?: string; stems?: { [key: string]: string }; metronome?: string };
       if (orig.stems) {
         const entries = await Promise.all(
           Object.entries(orig.stems).map(async ([k, u]) => [k, await pitchOne(u as string)] as const)
         );
         if (controller.signal.aborted) return;
-        newUrls = { stems: Object.fromEntries(entries) };
+        newUrls = { stems: Object.fromEntries(entries), metronome: orig.metronome };
       } else if (orig.master) {
         const url = await pitchOne(orig.master);
         if (controller.signal.aborted) return;
-        newUrls = { master: url };
+        newUrls = { master: url, metronome: orig.metronome };
       } else {
         return;
       }
@@ -428,6 +439,8 @@ export default function App() {
     try {
       let downloadUrl = '';
       let originalKey: string | null = null;
+      let bpm: number | null = null;
+      let metronomeUrl: string | null = null;
       if (addMode === 'youtube') {
         if (!newYoutubeUrl) throw new Error("Cole o link do YouTube");
         const res = await fetch(`${API_URL}/api/youtube`, {
@@ -447,6 +460,8 @@ export default function App() {
         const ytData = JSON.parse(rawBody);
         downloadUrl = ytData.url;
         originalKey = ytData.originalKey ?? null;
+        bpm = ytData.bpm ?? null;
+        metronomeUrl = ytData.metronomeUrl ?? null;
       } else {
         if (!newFile) throw new Error("Selecione um arquivo");
         const res = await FileSystem.uploadAsync(`${API_URL}/api/upload`, newFile.uri, {
@@ -468,11 +483,15 @@ export default function App() {
         if (!data.url) throw new Error("Servidor não retornou URL do arquivo");
         downloadUrl = data.url;
         originalKey = data.originalKey ?? null;
+        bpm = data.bpm ?? null;
+        metronomeUrl = data.metronomeUrl ?? null;
       }
 
       await addDoc(collection(db, 'songs'), {
         title: newTitle, author: newAuthor, audioUrl: downloadUrl,
         originalKey, // tom detectado pelo essentia (pode ser null se falhou)
+        bpm,         // BPM detectado pelo essentia
+        metronomeUrl, // URL da trilha de metrônomo gerada
         thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400&h=400&fit=crop',
         createdAt: serverTimestamp()
       });
@@ -652,6 +671,35 @@ export default function App() {
                   </View>
               }
             </TouchableOpacity>
+
+            {/* METRÔNOMO (faixa extra gerada automaticamente do BPM detectado) */}
+            {selectedSong?.metronomeUrl && (
+              <View className="bg-white/5 p-5 rounded-3xl mb-6 border border-white/5">
+                <View className="flex-row items-center justify-between mb-3">
+                  <View className="flex-1">
+                    <Text className="text-white font-medium">Metrônomo</Text>
+                    <Text className="text-white/40 text-xs">
+                      {selectedSong.bpm ? `${Math.round(selectedSong.bpm)} BPM detectado` : 'Click track sincronizado'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => toggleMute('metronome')}
+                    className={`w-12 h-12 rounded-xl items-center justify-center ${mutes.metronome ? 'bg-white/10' : 'bg-emerald-500/20'}`}
+                  >
+                    {mutes.metronome ? <VolumeX color="#ef4444" size={20} /> : <Clock color="#34d399" size={20} />}
+                  </TouchableOpacity>
+                </View>
+                <View className="flex-row items-center gap-3">
+                  <Text className="text-white/60 text-xs w-10">{volumes.metronome}%</Text>
+                  <Slider
+                    minimumValue={0} maximumValue={100} value={volumes.metronome}
+                    onValueChange={(val) => changeVolume('metronome', val)}
+                    minimumTrackTintColor="#10b981" maximumTrackTintColor="rgba(255,255,255,0.1)"
+                    thumbTintColor="#10b981" style={{ flex: 1, height: 20 }}
+                  />
+                </View>
+              </View>
+            )}
 
             {/* MIXER */}
             {!selectedSong?.stems ? (
