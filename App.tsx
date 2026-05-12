@@ -67,6 +67,43 @@ export default function App() {
     return () => clearInterval(id);
   }, [separateStartedAt]);
 
+  // Resync periódico dos stems: como cada Audio.Sound tem seu próprio clock,
+  // eles driftam ao longo do tempo. A cada 8s checa o drift e realinha pra mediana
+  // se passou de 150ms. Necessário pra stems ficarem sincronizadas a longo prazo.
+  useEffect(() => {
+    if (!playing) return;
+    const id = setInterval(async () => {
+      try {
+        const entries = Object.entries(soundsRef.current);
+        if (entries.length <= 1) return; // só com stems faz sentido
+
+        const positions: { key: string; pos: number }[] = [];
+        for (const [key, sound] of entries) {
+          const status: any = await sound.getStatusAsync();
+          if (status.isLoaded && typeof status.positionMillis === 'number') {
+            positions.push({ key, pos: status.positionMillis });
+          }
+        }
+        if (positions.length < 2) return;
+
+        const sorted = [...positions].sort((a, b) => a.pos - b.pos);
+        const drift = sorted[sorted.length - 1].pos - sorted[0].pos;
+        if (drift > 150) {
+          const median = sorted[Math.floor(sorted.length / 2)].pos;
+          console.log(`[stems sync] drift=${drift}ms, realinhando para ${median}ms`);
+          await Promise.all(
+            entries.map(([key, sound]) =>
+              sound.setPositionAsync(median).catch(() => {})
+            )
+          );
+        }
+      } catch {
+        // silencioso — não quero parar a música por erro de resync
+      }
+    }, 8000);
+    return () => clearInterval(id);
+  }, [playing]);
+
   // 1. Iniciar Firebase e carregar músicas
   useEffect(() => {
     const q = query(collection(db, 'songs'), orderBy('createdAt', 'desc'));
@@ -648,16 +685,16 @@ export default function App() {
               <View className="bg-black/40 border border-white/5 rounded-3xl p-5 mb-8">
                 <Text className="text-white font-medium mb-5">Mixer de 6 Faixas</Text>
                 {[
-                  { id: 'vocals', label: 'Voz' }, { id: 'drums', label: 'Bateria' }, 
-                  { id: 'bass', label: 'Baixo' }, { id: 'guitar', label: 'Guitarra' }, 
-                  { id: 'piano', label: 'Teclado' }, { id: 'other', label: 'Metrônomo' }
+                  { id: 'vocals', label: 'Voz' }, { id: 'drums', label: 'Bateria' },
+                  { id: 'bass', label: 'Baixo' }, { id: 'guitar', label: 'Guitarra' },
+                  { id: 'piano', label: 'Teclado' }, { id: 'other', label: 'Outros' }
                 ].map((stem) => (
                   <View key={stem.id} className="flex-row items-center gap-4 bg-white/5 p-3 rounded-2xl mb-3">
                     <TouchableOpacity 
                       onPress={() => toggleMute(stem.id)}
                       className={`w-10 h-10 rounded-xl items-center justify-center ${mutes[stem.id] ? 'bg-red-500/20' : 'bg-emerald-500/20'}`}
                     >
-                      {mutes[stem.id] ? <VolumeX color="#ef4444" size={18} /> : (stem.id === 'other' ? <Clock color="#34d399" size={18} /> : <Music color="#34d399" size={18} />)}
+                      {mutes[stem.id] ? <VolumeX color="#ef4444" size={18} /> : <Music color="#34d399" size={18} />}
                     </TouchableOpacity>
                     <View className="flex-1">
                       <View className="flex-row justify-between mb-1">
