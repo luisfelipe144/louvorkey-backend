@@ -49,6 +49,7 @@ export default function App() {
   const [separateElapsed, setSeparateElapsed] = useState(0);
   const [isPitchLoading, setIsPitchLoading] = useState(false);
   const [showPitchPicker, setShowPitchPicker] = useState(false);
+  const [showKeyOverride, setShowKeyOverride] = useState(false);
 
   // Mixer States
   const [volumes, setVolumes] = useState<{[key: string]: number}>({
@@ -241,6 +242,37 @@ export default function App() {
     applyPitch(next);
   };
 
+  // Permite ao usuário corrigir manualmente o tom original detectado pela IA.
+  const overrideOriginalKey = async (newKey: string) => {
+    if (!selectedSong) return;
+    setShowKeyOverride(false);
+    try {
+      await updateDoc(doc(db, 'songs', selectedSong.id), { originalKey: newKey });
+      setSelectedSong({ ...selectedSong, originalKey: newKey });
+    } catch (e: any) {
+      Alert.alert("Erro", "Não foi possível salvar o tom: " + e.message);
+    }
+  };
+
+  // Converte semitons em nota musical, usando o tom original detectado como base.
+  // Ex: original 'G' + 2 semitons = 'A'. Original 'Ab' + 1 = 'A'.
+  const SHARP_NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  const FLAT_TO_SHARP: { [k: string]: string } = {
+    'Db': 'C#', 'Eb': 'D#', 'Gb': 'F#', 'Ab': 'G#', 'Bb': 'A#'
+  };
+  const normalizeKey = (key: string | null | undefined): string => {
+    if (!key) return 'C';
+    const k = key.trim();
+    return FLAT_TO_SHARP[k] || k;
+  };
+  const semitonesToNote = (semitones: number, originalKey?: string | null) => {
+    const base = normalizeKey(originalKey);
+    const startIdx = SHARP_NOTES.indexOf(base);
+    const safeStart = startIdx === -1 ? 0 : startIdx;
+    const idx = ((safeStart + semitones) % 12 + 12) % 12;
+    return SHARP_NOTES[idx];
+  };
+
   const togglePlay = async () => {
     const sounds = Object.values(soundsRef.current);
     if (sounds.length === 0) return;
@@ -325,6 +357,7 @@ export default function App() {
     
     try {
       let downloadUrl = '';
+      let originalKey: string | null = null;
       if (addMode === 'youtube') {
         if (!newYoutubeUrl) throw new Error("Cole o link do YouTube");
         const res = await fetch(`${API_URL}/api/youtube`, {
@@ -341,7 +374,9 @@ export default function App() {
           } catch {}
           throw new Error(`YouTube falhou (HTTP ${res.status}): ${detail}`);
         }
-        downloadUrl = JSON.parse(rawBody).url;
+        const ytData = JSON.parse(rawBody);
+        downloadUrl = ytData.url;
+        originalKey = ytData.originalKey ?? null;
       } else {
         if (!newFile) throw new Error("Selecione um arquivo");
         const res = await FileSystem.uploadAsync(`${API_URL}/api/upload`, newFile.uri, {
@@ -362,10 +397,12 @@ export default function App() {
         const data = JSON.parse(res.body);
         if (!data.url) throw new Error("Servidor não retornou URL do arquivo");
         downloadUrl = data.url;
+        originalKey = data.originalKey ?? null;
       }
 
       await addDoc(collection(db, 'songs'), {
         title: newTitle, author: newAuthor, audioUrl: downloadUrl,
+        originalKey, // tom detectado pelo essentia (pode ser null se falhou)
         thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400&h=400&fit=crop',
         createdAt: serverTimestamp()
       });
@@ -531,13 +568,17 @@ export default function App() {
               <View className="flex-1">
                 <Text className="text-white font-medium">Tom</Text>
                 <Text className="text-white/40 text-xs">
-                  {isPitchLoading ? 'Aplicando tom... (10-15s)' : `C ${pitch > 0 ? `+${pitch}` : pitch} semitons — toque para mudar`}
+                  {isPitchLoading
+                    ? 'Aplicando tom... (10-15s)'
+                    : selectedSong?.originalKey
+                      ? `Original: ${normalizeKey(selectedSong.originalKey)} — toque para mudar`
+                      : 'Tom original não detectado — toque para escolher'}
                 </Text>
               </View>
               {isPitchLoading
                 ? <ActivityIndicator color="#34d399" />
-                : <View className="bg-emerald-500/20 px-3 py-1.5 rounded-lg">
-                    <Text className="text-emerald-400 font-bold">{pitch > 0 ? `+${pitch}` : pitch}</Text>
+                : <View className="bg-emerald-500/20 px-4 py-2 rounded-lg min-w-[60px] items-center">
+                    <Text className="text-emerald-400 font-bold text-lg">{semitonesToNote(pitch, selectedSong?.originalKey)}</Text>
                   </View>
               }
             </TouchableOpacity>
@@ -609,38 +650,81 @@ export default function App() {
       <Modal visible={showPitchPicker} animationType="fade" transparent onRequestClose={() => setShowPitchPicker(false)}>
         <View className="flex-1 bg-black/80 justify-center items-center p-6">
           <View className="bg-[#121212] w-full max-w-sm rounded-3xl p-6 border border-white/10">
-            <View className="flex-row justify-between items-center mb-4">
+            <View className="flex-row justify-between items-center mb-2">
               <Text className="text-white font-semibold text-xl">Escolha o tom</Text>
               <TouchableOpacity onPress={() => setShowPitchPicker(false)}>
                 <X color="white" size={24} opacity={0.5}/>
               </TouchableOpacity>
             </View>
+            <Text className="text-white/40 text-xs mb-3">
+              Tom original detectado: <Text className="text-emerald-400 font-bold">{selectedSong?.originalKey ? normalizeKey(selectedSong.originalKey) : '?'}</Text>
+              {selectedSong?.originalKey && (
+                <Text className="text-white/30"> — toque longo no botão verde pra corrigir</Text>
+              )}
+            </Text>
             <Text className="text-white/40 text-xs mb-5">
-              Versões já geradas tocam na hora. Tons novos demoram ~10-15s pra serem processados pela primeira vez.
+              Tons já gerados antes tocam instantâneo. Tons novos levam ~10-15s pra processar.
             </Text>
 
             <View className="flex-row flex-wrap justify-center gap-2">
               {Array.from({ length: 13 }, (_, i) => i - 6).map((semitones) => {
                 const isCurrent = semitones === pitch;
-                const label = semitones === 0 ? 'C' : (semitones > 0 ? `+${semitones}` : `${semitones}`);
+                const note = semitonesToNote(semitones, selectedSong?.originalKey);
+                const shiftLabel = semitones === 0 ? 'original' : (semitones > 0 ? `+${semitones}` : `${semitones}`);
                 return (
                   <TouchableOpacity
                     key={semitones}
                     onPress={() => selectPitch(semitones)}
-                    className={`w-16 h-14 rounded-2xl items-center justify-center border ${
+                    onLongPress={() => semitones === 0 && setShowKeyOverride(true)}
+                    delayLongPress={400}
+                    className={`w-[68px] h-16 rounded-2xl items-center justify-center border ${
                       isCurrent
                         ? 'bg-emerald-500 border-emerald-400'
                         : 'bg-white/5 border-white/10'
                     }`}
                   >
-                    <Text className={`font-bold text-lg ${isCurrent ? 'text-white' : 'text-white/80'}`}>
-                      {label}
+                    <Text className={`font-bold text-xl ${isCurrent ? 'text-white' : 'text-white/90'}`}>
+                      {note}
                     </Text>
-                    {semitones === 0 && (
-                      <Text className={`text-[10px] ${isCurrent ? 'text-white/80' : 'text-white/40'}`}>
-                        original
-                      </Text>
-                    )}
+                    <Text className={`text-[10px] ${isCurrent ? 'text-white/80' : 'text-white/40'}`}>
+                      {shiftLabel}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* CORRIGIR TOM ORIGINAL MODAL */}
+      <Modal visible={showKeyOverride} animationType="fade" transparent onRequestClose={() => setShowKeyOverride(false)}>
+        <View className="flex-1 bg-black/80 justify-center items-center p-6">
+          <View className="bg-[#121212] w-full max-w-sm rounded-3xl p-6 border border-white/10">
+            <View className="flex-row justify-between items-center mb-2">
+              <Text className="text-white font-semibold text-xl">Corrigir tom original</Text>
+              <TouchableOpacity onPress={() => setShowKeyOverride(false)}>
+                <X color="white" size={24} opacity={0.5}/>
+              </TouchableOpacity>
+            </View>
+            <Text className="text-white/40 text-xs mb-5">
+              A detecção automática está errada? Selecione o tom real abaixo. Vai ser salvo pra essa música.
+            </Text>
+
+            <View className="flex-row flex-wrap justify-center gap-2">
+              {SHARP_NOTES.map((note) => {
+                const isCurrent = normalizeKey(selectedSong?.originalKey) === note;
+                return (
+                  <TouchableOpacity
+                    key={note}
+                    onPress={() => overrideOriginalKey(note)}
+                    className={`w-16 h-14 rounded-2xl items-center justify-center border ${
+                      isCurrent ? 'bg-emerald-500 border-emerald-400' : 'bg-white/5 border-white/10'
+                    }`}
+                  >
+                    <Text className={`font-bold text-lg ${isCurrent ? 'text-white' : 'text-white/90'}`}>
+                      {note}
+                    </Text>
                   </TouchableOpacity>
                 );
               })}

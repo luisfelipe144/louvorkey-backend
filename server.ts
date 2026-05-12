@@ -10,10 +10,66 @@ import { promisify } from "util";
 import Replicate from "replicate";
 import { v2 as cloudinary } from "cloudinary";
 import ffmpegStatic from "ffmpeg-static";
+import EssentiaPkg from "essentia.js";
 import "dotenv/config";
 
 const execFileAsync = promisify(execFile);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
+
+// essentia.js carrega via WASM. Inicializamos uma vez e reusamos.
+const { Essentia, EssentiaWASM } = EssentiaPkg as any;
+let essentiaInstance: any = null;
+async function getEssentia(): Promise<any> {
+  if (essentiaInstance) return essentiaInstance;
+  const wasm = typeof EssentiaWASM === 'function' ? await EssentiaWASM() : EssentiaWASM;
+  essentiaInstance = new Essentia(wasm);
+  console.log(`[essentia] versão ${essentiaInstance.version} carregada`);
+  return essentiaInstance;
+}
+
+// Decodifica MP3 -> mono PCM float32 22050Hz via ffmpeg.
+async function decodeMp3ToFloat32(audioBuffer: Buffer): Promise<Float32Array> {
+  const uid = crypto.randomUUID();
+  const tmpIn = path.join(os.tmpdir(), `dec-in-${uid}.mp3`);
+  const tmpOut = path.join(os.tmpdir(), `dec-out-${uid}.pcm`);
+  await fs.promises.writeFile(tmpIn, audioBuffer);
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y', '-i', tmpIn,
+      '-ac', '1',
+      '-ar', '22050',
+      '-f', 'f32le',
+      tmpOut,
+    ], { maxBuffer: 200 * 1024 * 1024 });
+    const pcmBuf = await fs.promises.readFile(tmpOut);
+    return new Float32Array(pcmBuf.buffer.slice(pcmBuf.byteOffset, pcmBuf.byteOffset + pcmBuf.byteLength));
+  } finally {
+    fs.promises.unlink(tmpIn).catch(() => {});
+    fs.promises.unlink(tmpOut).catch(() => {});
+  }
+}
+
+// Detecta o tom (key + scale) do áudio. Retorna null em caso de erro.
+async function detectKey(audioBuffer: Buffer): Promise<{ key: string; scale: string; strength: number } | null> {
+  try {
+    console.log('[detectKey] decodificando MP3...');
+    const pcm = await decodeMp3ToFloat32(audioBuffer);
+    console.log(`[detectKey] PCM ${pcm.length} samples (${(pcm.length / 22050).toFixed(1)}s), rodando KeyExtractor...`);
+
+    const essentia = await getEssentia();
+    const vec = essentia.arrayToVector(pcm);
+    try {
+      const result = essentia.KeyExtractor(vec);
+      console.log(`[detectKey] resultado: ${result.key} ${result.scale} (strength=${result.strength?.toFixed(3)})`);
+      return { key: result.key, scale: result.scale, strength: result.strength };
+    } finally {
+      vec.delete?.();
+    }
+  } catch (e: any) {
+    console.error('[detectKey] Erro:', e.message);
+    return null;
+  }
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,10 +127,19 @@ async function startServer() {
 
       console.log(`Upload pro Cloudinary: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
       const publicId = `upload-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      const url = await uploadAudioToCloudinary(file.buffer, "songs", publicId);
-      console.log(`Upload concluído: ${url}`);
 
-      res.json({ url });
+      // Roda upload e detecção de tom em paralelo
+      const [url, detection] = await Promise.all([
+        uploadAudioToCloudinary(file.buffer, "songs", publicId),
+        detectKey(file.buffer),
+      ]);
+      console.log(`Upload concluído: ${url} | tom: ${detection?.key ?? '?'} ${detection?.scale ?? ''}`);
+
+      res.json({
+        url,
+        originalKey: detection?.key ?? null,
+        originalScale: detection?.scale ?? null,
+      });
     } catch (error: any) {
       console.error("Erro no upload pro Cloudinary:", error);
       res.status(500).json({ error: error.message });
@@ -149,14 +214,22 @@ async function startServer() {
       }
 
       const { audioBuffer, filename: cobaltFilename } = await fetchFromCobalt(url);
+      const audioBuf = Buffer.from(audioBuffer);
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
       console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
-      const cloudinaryUrl = await uploadAudioToCloudinary(new Uint8Array(audioBuffer), "songs", publicId);
+
+      const [cloudinaryUrl, detection] = await Promise.all([
+        uploadAudioToCloudinary(audioBuf, "songs", publicId),
+        detectKey(audioBuf),
+      ]);
+      console.log(`YouTube concluído: ${cloudinaryUrl} | tom: ${detection?.key ?? '?'} ${detection?.scale ?? ''}`);
 
       res.json({
         url: cloudinaryUrl,
         title: cobaltFilename || "Áudio do YouTube",
+        originalKey: detection?.key ?? null,
+        originalScale: detection?.scale ?? null,
       });
     } catch (error: any) {
       console.error("Erro no download do YouTube:", error);
