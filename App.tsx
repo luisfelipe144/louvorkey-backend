@@ -20,11 +20,21 @@ import './global.css';
 
 // URL de Produção na Nuvem (Render)
 const API_URL = 'https://louvorkey-backend.onrender.com'; 
+const STEM_LABELS: { [key: string]: string } = {
+  vocals: 'Voz',
+  drums: 'Bateria',
+  bass: 'Baixo',
+  guitar: 'Guitarra',
+  piano: 'Teclado',
+  other: 'Instrumental',
+};
+const STEM_ORDER = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
 
 export default function App() {
   const [songs, setSongs] = useState<any[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedSong, setSelectedSong] = useState<any>(null);
+  const selectedSongRef = useRef<any>(null);
   
   // Add Song Modal
   const [showAddModal, setShowAddModal] = useState(false);
@@ -37,6 +47,7 @@ export default function App() {
 
   // Audio Engine States
   const soundsRef = useRef<{ [key: string]: Audio.Sound }>({});
+  const analysisInProgressRef = useRef<Set<string>>(new Set());
   // URLs originais da música atual (sem pitch shift) — usadas como base para gerar versões pitched
   const originalUrlsRef = useRef<{ master?: string; stems?: { [key: string]: string }; metronome?: string }>({});
   // Cancela requests de pitch antigas quando o usuário muda rápido
@@ -59,6 +70,10 @@ export default function App() {
     vocals: false, drums: false, bass: false, guitar: false, piano: false, other: false, metronome: true, master: false
   });
   const [pitch, setPitch] = useState(0);
+
+  useEffect(() => {
+    selectedSongRef.current = selectedSong;
+  }, [selectedSong]);
 
   // Tick a cada 1s enquanto está separando — mostra timer decorrido
   useEffect(() => {
@@ -88,7 +103,7 @@ export default function App() {
 
         const sorted = [...positions].sort((a, b) => a.pos - b.pos);
         const drift = sorted[sorted.length - 1].pos - sorted[0].pos;
-        if (drift > 150) {
+        if (drift > 70) {
           const median = sorted[Math.floor(sorted.length / 2)].pos;
           console.log(`[stems sync] drift=${drift}ms, realinhando para ${median}ms`);
           await Promise.all(
@@ -100,7 +115,7 @@ export default function App() {
       } catch {
         // silencioso — não quero parar a música por erro de resync
       }
-    }, 8000);
+    }, 2500);
     return () => clearInterval(id);
   }, [playing]);
 
@@ -149,6 +164,10 @@ export default function App() {
       });
 
       await loadSoundsFromUrls(originalUrlsRef.current);
+
+      if (song.id && song.audioUrl && (!song.metronomeUrl || !song.originalKey || !song.bpm)) {
+        void pollAnalysisJob(song.id, null, song.audioUrl);
+      }
     } catch (e) {
       Alert.alert("Erro", "Falha ao carregar áudio");
       console.error(e);
@@ -159,14 +178,17 @@ export default function App() {
   // Não toca em originalUrlsRef — só hidrata o soundsRef.
   const loadSoundsFromUrls = async (urls: { master?: string; stems?: { [key: string]: string }; metronome?: string }) => {
     if (urls.stems) {
-      const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
+      const stemKeys = STEM_ORDER.filter(key => urls.stems?.[key]);
       let trackerKey: string | null = null;
       for (const key of stemKeys) {
         let url = urls.stems[key];
         if (!url) continue;
         if (url.startsWith('/uploads')) url = `${API_URL}${url}`;
 
-        const { sound } = await Audio.Sound.createAsync({ uri: url });
+        const { sound } = await Audio.Sound.createAsync(
+          { uri: url },
+          { shouldPlay: false, positionMillis: 0, progressUpdateIntervalMillis: 500 }
+        );
         soundsRef.current[key] = sound;
         await sound.setVolumeAsync(mutes[key] ? 0 : (volumes[key] / 100));
 
@@ -185,7 +207,10 @@ export default function App() {
       let url = urls.master;
       if (url.startsWith('/uploads')) url = `${API_URL}${url}`;
 
-      const { sound } = await Audio.Sound.createAsync({ uri: url });
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: url },
+        { shouldPlay: false, positionMillis: 0, progressUpdateIntervalMillis: 500 }
+      );
       soundsRef.current['master'] = sound;
       await sound.setVolumeAsync(mutes.master ? 0 : (volumes.master / 100));
       sound.setOnPlaybackStatusUpdate((status: any) => {
@@ -200,7 +225,10 @@ export default function App() {
     // Metrônomo (faixa extra independente — carrega se disponível e adiciona ao soundsRef)
     if (urls.metronome) {
       try {
-        const { sound: metroSound } = await Audio.Sound.createAsync({ uri: urls.metronome });
+        const { sound: metroSound } = await Audio.Sound.createAsync(
+          { uri: urls.metronome },
+          { shouldPlay: false, positionMillis: 0, progressUpdateIntervalMillis: 500 }
+        );
         soundsRef.current['metronome'] = metroSound;
         await metroSound.setVolumeAsync(mutes.metronome ? 0 : (volumes.metronome / 100));
       } catch (e) {
@@ -329,8 +357,30 @@ export default function App() {
       await Promise.all(sounds.map(s => s.pauseAsync()));
       setPlaying(false);
     } else {
-      await Promise.all(sounds.map(s => s.playAsync()));
+      const targetPosition = position;
+      await Promise.all(
+        sounds.map(s =>
+          s.setStatusAsync({ positionMillis: targetPosition, shouldPlay: true }).catch(() => {})
+        )
+      );
       setPlaying(true);
+
+      setTimeout(() => {
+        void (async () => {
+          const latestSounds = Object.values(soundsRef.current);
+          const positions: number[] = [];
+          for (const sound of latestSounds) {
+            const status: any = await sound.getStatusAsync().catch(() => null);
+            if (status?.isLoaded && typeof status.positionMillis === 'number') {
+              positions.push(status.positionMillis);
+            }
+          }
+          if (positions.length < 2) return;
+          positions.sort((a, b) => a - b);
+          const median = positions[Math.floor(positions.length / 2)];
+          await Promise.all(latestSounds.map(s => s.setPositionAsync(median).catch(() => {})));
+        })();
+      }, 350);
     }
   };
 
@@ -387,10 +437,12 @@ export default function App() {
       if (!jobId) throw new Error("Servidor não retornou jobId");
 
       // 2) Poll de status a cada 5s, até succeeded/failed ou 10 min de timeout
-      const MAX_ATTEMPTS = 120; // 120 × 5s = 10 min
+      const MAX_ATTEMPTS = 400; // 400 x 3s = 20 min
       let stems: any = null;
+      let separationModel: string | null = null;
+      let stemsFormat: string | null = null;
       for (let i = 0; i < MAX_ATTEMPTS; i++) {
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise(r => setTimeout(r, 3000));
 
         const statusRes = await fetch(`${API_URL}/api/separate/status/${jobId}`);
         if (!statusRes.ok) {
@@ -402,6 +454,8 @@ export default function App() {
         const data = await statusRes.json();
         if (data.status === 'succeeded') {
           stems = data.stems;
+          separationModel = data.model ?? null;
+          stemsFormat = data.outputFormat ?? null;
           break;
         }
         if (data.status === 'failed' || data.status === 'canceled') {
@@ -410,12 +464,16 @@ export default function App() {
         // starting / processing — continua polling
       }
 
-      if (!stems) throw new Error("Timeout: separação demorou mais de 10 minutos");
+      if (!stems) throw new Error("Timeout: separação demorou mais de 20 minutos");
 
-      await updateDoc(doc(db, 'songs', selectedSong.id), { stems });
-      setSelectedSong({ ...selectedSong, stems });
+      await updateDoc(doc(db, 'songs', selectedSong.id), { stems, separationModel, stemsFormat });
+      const updatedSong = { ...selectedSong, stems, separationModel, stemsFormat };
+      setSelectedSong(updatedSong);
+      if (!selectedSong.metronomeUrl && selectedSong.audioUrl) {
+        void pollAnalysisJob(selectedSong.id, null, selectedSong.audioUrl);
+      }
       Alert.alert("Sucesso", "Faixas separadas!");
-      await handleSelectSong({ ...selectedSong, stems }); // Recarrega com stems
+      await handleSelectSong(updatedSong); // Recarrega com stems
     } catch (e: any) {
       Alert.alert("Erro", e.message);
     } finally {
@@ -433,6 +491,8 @@ export default function App() {
   };
 
   const pollAnalysisJob = async (songId: string, analysisJobId?: string | null, audioUrl?: string) => {
+    if (analysisInProgressRef.current.has(songId)) return;
+    analysisInProgressRef.current.add(songId);
     let jobId = analysisJobId || null;
 
     try {
@@ -469,6 +529,21 @@ export default function App() {
             metronomeUrl: result.metronomeUrl ?? null,
             durationS: result.durationS ?? null,
           });
+          setSelectedSong((current: any) =>
+            current?.id === songId
+              ? {
+                  ...current,
+                  originalKey: result.originalKey ?? null,
+                  originalScale: result.originalScale ?? null,
+                  bpm: result.bpm ?? null,
+                  metronomeUrl: result.metronomeUrl ?? null,
+                  durationS: result.durationS ?? null,
+                }
+              : current
+          );
+          if (result.metronomeUrl && selectedSongRef.current?.id === songId && !soundsRef.current.metronome) {
+            await loadSoundsFromUrls({ metronome: result.metronomeUrl }).catch(() => {});
+          }
           return;
         }
 
@@ -480,6 +555,8 @@ export default function App() {
       console.log(`Analise ${jobId} nao terminou em 10 minutos`);
     } catch (e: any) {
       console.log('Analise em segundo plano falhou:', e.message || e);
+    } finally {
+      analysisInProgressRef.current.delete(songId);
     }
   };
 
@@ -770,7 +847,7 @@ export default function App() {
               <View className="bg-white/5 p-5 rounded-3xl mb-6 border border-white/5">
                 <View className="flex-row items-center justify-between mb-3">
                   <View className="flex-1">
-                    <Text className="text-white font-medium">Metrônomo</Text>
+                    <Text className="text-white font-medium">Metrônomo virtual</Text>
                     <Text className="text-white/40 text-xs">
                       {selectedSong.bpm ? `${Math.round(selectedSong.bpm)} BPM detectado` : 'Click track sincronizado'}
                     </Text>
@@ -805,31 +882,47 @@ export default function App() {
                     <View className="flex-row items-center gap-3">
                       <ActivityIndicator color="#34d399" />
                       <Text className="text-emerald-400 font-semibold">
-                        Separando faixas com IA...
+                        Separando faixas com IA Pro...
                       </Text>
                     </View>
                     <Text className="text-white/50 text-xs">
-                      {formatTime(separateElapsed)} decorridos · espera entre 2-4 min
+                      {formatTime(separateElapsed)} decorridos · qualidade Pro pode demorar mais
                     </Text>
                     <Text className="text-white/30 text-[10px]">
-                      Não feche o app · Demucs rodando em GPU
+                      Não feche o app · Demucs fine-tuned em GPU
                     </Text>
                   </View>
                 ) : (
                   <View className="flex-row items-center gap-3">
                     <Music color="#34d399" size={20} />
-                    <Text className="text-emerald-400 font-semibold">Separar 6 Faixas com IA</Text>
+                    <Text className="text-emerald-400 font-semibold">Separar faixas com IA Pro</Text>
                   </View>
                 )}
               </TouchableOpacity>
             ) : (
               <View className="bg-black/40 border border-white/5 rounded-3xl p-5 mb-8">
-                <Text className="text-white font-medium mb-5">Mixer de 6 Faixas</Text>
-                {[
-                  { id: 'vocals', label: 'Voz' }, { id: 'drums', label: 'Bateria' },
-                  { id: 'bass', label: 'Baixo' }, { id: 'guitar', label: 'Guitarra' },
-                  { id: 'piano', label: 'Teclado' }, { id: 'other', label: 'Outros' }
-                ].map((stem) => (
+                <Text className="text-white font-medium mb-2">Mixer Profissional</Text>
+                <Text className="text-white/40 text-xs mb-5">
+                  Stems em alta qualidade, alinhados pelo player. Metrônomo virtual fica separado abaixo do tom.
+                </Text>
+                <TouchableOpacity
+                  onPress={handleSeparateStems}
+                  disabled={isSeparating}
+                  className="bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-3 mb-5 items-center"
+                >
+                  {isSeparating ? (
+                    <View className="flex-row items-center gap-2">
+                      <ActivityIndicator color="#34d399" />
+                      <Text className="text-emerald-400 font-semibold text-sm">Reprocessando IA Pro...</Text>
+                    </View>
+                  ) : (
+                    <Text className="text-emerald-400 font-semibold text-sm">Reprocessar IA Pro</Text>
+                  )}
+                </TouchableOpacity>
+                {STEM_ORDER
+                  .filter((id) => !!selectedSong?.stems?.[id])
+                  .map((id) => ({ id, label: STEM_LABELS[id] || id }))
+                  .map((stem) => (
                   <View key={stem.id} className="flex-row items-center gap-4 bg-white/5 p-3 rounded-2xl mb-3">
                     <TouchableOpacity 
                       onPress={() => toggleMute(stem.id)}

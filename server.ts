@@ -174,13 +174,14 @@ cloudinary.config({ secure: true });
 async function uploadAudioToCloudinary(
   buffer: Buffer | Uint8Array,
   folder: string,
-  publicId?: string
+  publicId?: string,
+  format = "mp3"
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const opts: any = {
       resource_type: "video",
       folder,
-      format: "mp3",
+      format,
     };
     if (publicId) opts.public_id = publicId;
 
@@ -210,6 +211,21 @@ type AnalysisJob = {
 };
 
 const upload = multer({ storage: multer.memoryStorage() });
+const DEMUCS_VERSION = "25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953";
+const DEMUCS_MODEL = process.env.DEMUCS_MODEL || "htdemucs_ft";
+const DEMUCS_OUTPUT_FORMAT = process.env.DEMUCS_OUTPUT_FORMAT || "wav";
+const DEMUCS_STEMS_BY_MODEL: Record<string, string[]> = {
+  htdemucs_6s: ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'],
+  htdemucs: ['vocals', 'drums', 'bass', 'other'],
+  htdemucs_ft: ['vocals', 'drums', 'bass', 'other'],
+  hdemucs_mmi: ['vocals', 'drums', 'bass', 'other'],
+  mdx: ['vocals', 'drums', 'bass', 'other'],
+  mdx_extra: ['vocals', 'drums', 'bass', 'other'],
+};
+
+function getDemucsStemKeys(modelName = DEMUCS_MODEL) {
+  return DEMUCS_STEMS_BY_MODEL[modelName] || DEMUCS_STEMS_BY_MODEL.htdemucs_ft;
+}
 
 async function startServer() {
   if (!process.env.CLOUDINARY_URL) {
@@ -496,16 +512,16 @@ async function startServer() {
 
       console.log(`[separate] criando predição Demucs htdemucs_6s para ${audioUrl}`);
       const prediction = await replicate.predictions.create({
-        version: "25a173108cff36ef9f80f854c162d01df9e6528be175794b81158fa03836d953",
+        version: DEMUCS_VERSION,
         input: {
           audio: audioUrl,
-          model_name: "htdemucs_6s",
-          output_format: "mp3",
+          model_name: DEMUCS_MODEL,
+          output_format: DEMUCS_OUTPUT_FORMAT,
         },
       });
 
       console.log(`[separate] prediction iniciada: ${prediction.id}`);
-      res.json({ jobId: prediction.id });
+      res.json({ jobId: prediction.id, model: DEMUCS_MODEL, outputFormat: DEMUCS_OUTPUT_FORMAT });
     } catch (err: any) {
       console.error("Erro ao iniciar separação:", err);
       res.status(500).json({ error: "Erro ao iniciar separação", details: err.message });
@@ -519,7 +535,7 @@ async function startServer() {
 
       // Cache hit: stems já foram transferidos antes
       if (stemsCache.has(jobId)) {
-        return res.json({ status: 'succeeded', stems: stemsCache.get(jobId) });
+        return res.json({ status: 'succeeded', stems: stemsCache.get(jobId), model: DEMUCS_MODEL, outputFormat: DEMUCS_OUTPUT_FORMAT });
       }
 
       if (!process.env.REPLICATE_API_TOKEN) {
@@ -542,7 +558,7 @@ async function startServer() {
       const output: any = prediction.output;
       const stems: { [key: string]: string } = {};
       const uniqueSession = jobId.slice(0, 8);
-      const stemKeys = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
+      const stemKeys = getDemucsStemKeys(DEMUCS_MODEL);
 
       console.log(`[separate] ${jobId} succeeded, transferindo ${stemKeys.length} stems pro Cloudinary...`);
       await Promise.all(stemKeys.map(async (key) => {
@@ -553,7 +569,8 @@ async function startServer() {
             stems[key] = await uploadAudioToCloudinary(
               new Uint8Array(stemBuffer),
               "stems",
-              `${uniqueSession}-${key}`
+              `${uniqueSession}-${key}`,
+              DEMUCS_OUTPUT_FORMAT
             );
           } catch (e) {
             console.error(`Erro ao transferir faixa ${key}:`, e);
@@ -563,7 +580,7 @@ async function startServer() {
 
       stemsCache.set(jobId, stems);
       console.log(`[separate] ${jobId} transferido (${Object.keys(stems).length} stems)`);
-      res.json({ status: 'succeeded', stems });
+      res.json({ status: 'succeeded', stems, model: DEMUCS_MODEL, outputFormat: DEMUCS_OUTPUT_FORMAT });
     } catch (err: any) {
       console.error("Erro no status da separação:", err);
       res.status(500).json({ error: "Erro no status", details: err.message });
