@@ -5,7 +5,7 @@ import {
   TextInput, Modal, ActivityIndicator, Alert, Platform 
 } from 'react-native';
 import { 
-  Music, Search, Youtube, Plus, X, Play, Pause, 
+  Music, Search, Plus, X, Play, Pause, 
   RotateCcw, ChevronUp, ChevronDown, Clock, Download, UploadCloud, FileAudio,
   Volume2, VolumeX, Trash2
 } from 'lucide-react-native';
@@ -432,6 +432,57 @@ export default function App() {
     } catch (err) { }
   };
 
+  const pollAnalysisJob = async (songId: string, analysisJobId?: string | null, audioUrl?: string) => {
+    let jobId = analysisJobId || null;
+
+    try {
+      if (!jobId && audioUrl) {
+        const startRes = await fetch(`${API_URL}/api/analyze/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audioUrl }),
+        });
+        if (!startRes.ok) throw new Error(`Falha ao iniciar analise (HTTP ${startRes.status})`);
+        const startData = await startRes.json();
+        jobId = startData.jobId;
+      }
+
+      if (!jobId) return;
+
+      const MAX_ATTEMPTS = 120; // 10 min
+      for (let i = 0; i < MAX_ATTEMPTS; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+
+        const statusRes = await fetch(`${API_URL}/api/analyze/status/${jobId}`);
+        if (!statusRes.ok) {
+          console.log(`Analise poll ${i} retornou ${statusRes.status}, tentando de novo...`);
+          continue;
+        }
+
+        const data = await statusRes.json();
+        if (data.status === 'succeeded') {
+          const result = data.result || {};
+          await updateDoc(doc(db, 'songs', songId), {
+            originalKey: result.originalKey ?? null,
+            originalScale: result.originalScale ?? null,
+            bpm: result.bpm ?? null,
+            metronomeUrl: result.metronomeUrl ?? null,
+            durationS: result.durationS ?? null,
+          });
+          return;
+        }
+
+        if (data.status === 'failed') {
+          throw new Error(data.error || 'erro desconhecido na analise');
+        }
+      }
+
+      console.log(`Analise ${jobId} nao terminou em 10 minutos`);
+    } catch (e: any) {
+      console.log('Analise em segundo plano falhou:', e.message || e);
+    }
+  };
+
   const handleAddSong = async () => {
     if (!newTitle || !newAuthor) return Alert.alert("Erro", "Preencha todos os campos");
     setIsAdding(true);
@@ -439,8 +490,11 @@ export default function App() {
     try {
       let downloadUrl = '';
       let originalKey: string | null = null;
+      let originalScale: string | null = null;
       let bpm: number | null = null;
       let metronomeUrl: string | null = null;
+      let durationS: number | null = null;
+      let analysisJobId: string | null = null;
       if (addMode === 'youtube') {
         if (!newYoutubeUrl) throw new Error("Cole o link do YouTube");
         const res = await fetch(`${API_URL}/api/youtube`, {
@@ -460,45 +514,84 @@ export default function App() {
         const ytData = JSON.parse(rawBody);
         downloadUrl = ytData.url;
         originalKey = ytData.originalKey ?? null;
+        originalScale = ytData.originalScale ?? null;
         bpm = ytData.bpm ?? null;
         metronomeUrl = ytData.metronomeUrl ?? null;
+        durationS = ytData.durationS ?? null;
       } else {
         if (!newFile) throw new Error("Selecione um arquivo");
-        const res = await FileSystem.uploadAsync(`${API_URL}/api/upload`, newFile.uri, {
+        const signRes = await fetch(`${API_URL}/api/cloudinary/sign-upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: newFile.name }),
+        });
+        const signBody = await signRes.text();
+        if (!signRes.ok) {
+          let detail = signBody;
+          try {
+            const parsed = JSON.parse(signBody);
+            detail = parsed.error || parsed.details || signBody;
+          } catch {}
+          throw new Error(`Falha ao preparar upload (HTTP ${signRes.status}): ${detail?.slice?.(0, 300) || detail}`);
+        }
+
+        const signedUpload = JSON.parse(signBody);
+        const res = await FileSystem.uploadAsync(signedUpload.uploadUrl, newFile.uri, {
           httpMethod: 'POST',
           uploadType: FileSystem.FileSystemUploadType.MULTIPART,
           fieldName: 'file',
           mimeType: newFile.mimeType || 'audio/mpeg',
+          parameters: {
+            api_key: String(signedUpload.apiKey),
+            timestamp: String(signedUpload.timestamp),
+            signature: String(signedUpload.signature),
+            folder: String(signedUpload.folder),
+            public_id: String(signedUpload.publicId),
+          },
         });
 
-        if (res.status !== 200) {
+        if (res.status !== 200 && res.status !== 201) {
           let detail = res.body;
           try {
             const parsed = JSON.parse(res.body);
-            detail = parsed.error || parsed.details || res.body;
+            detail = parsed.error?.message || parsed.error || parsed.details || res.body;
           } catch {}
-          throw new Error(`Upload falhou (HTTP ${res.status}): ${detail?.slice?.(0, 300) || detail}`);
+          throw new Error(`Upload no Cloudinary falhou (HTTP ${res.status}): ${detail?.slice?.(0, 300) || detail}`);
         }
         const data = JSON.parse(res.body);
-        if (!data.url) throw new Error("Servidor não retornou URL do arquivo");
-        downloadUrl = data.url;
+        if (!data.secure_url) throw new Error("Cloudinary nao retornou URL do arquivo");
+        downloadUrl = data.secure_url;
         originalKey = data.originalKey ?? null;
+        originalScale = data.originalScale ?? null;
         bpm = data.bpm ?? null;
         metronomeUrl = data.metronomeUrl ?? null;
+        durationS = data.durationS ?? null;
+        analysisJobId = data.analysisJobId ?? null;
       }
 
-      await addDoc(collection(db, 'songs'), {
+      const songRef = await addDoc(collection(db, 'songs'), {
         title: newTitle, author: newAuthor, audioUrl: downloadUrl,
         originalKey, // tom detectado pelo essentia (pode ser null se falhou)
+        originalScale,
         bpm,         // BPM detectado pelo essentia
         metronomeUrl, // URL da trilha de metrônomo gerada
+        durationS,
         thumbnail: 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=400&h=400&fit=crop',
         createdAt: serverTimestamp()
       });
+
+      if (analysisJobId || (addMode === 'local' && downloadUrl)) {
+        void pollAnalysisJob(songRef.id, analysisJobId, downloadUrl);
+      }
       
       setShowAddModal(false);
       setNewTitle(''); setNewAuthor(''); setNewFile(null); setNewYoutubeUrl('');
-      Alert.alert("Sucesso", "Música adicionada!");
+      Alert.alert(
+        "Sucesso",
+        analysisJobId || addMode === 'local'
+          ? "Música adicionada! Tom, BPM e metrônomo serão processados em segundo plano."
+          : "Música adicionada!"
+      );
     } catch (e: any) {
       Alert.alert("Erro", e.message);
     } finally {

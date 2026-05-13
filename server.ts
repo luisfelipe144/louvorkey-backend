@@ -194,6 +194,21 @@ async function uploadAudioToCloudinary(
 }
 
 // Configuração do Multer (memória)
+type AudioMetadata = {
+  originalKey: string | null;
+  originalScale: string | null;
+  bpm: number | null;
+  metronomeUrl: string | null;
+  durationS: number | null;
+};
+
+type AnalysisJob = {
+  status: 'processing' | 'succeeded' | 'failed';
+  result?: AudioMetadata;
+  error?: string;
+  createdAt: number;
+};
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 async function startServer() {
@@ -206,13 +221,43 @@ async function startServer() {
 
   app.use(express.json());
 
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, service: "louvorkey-backend" });
+  });
+
+  app.post("/api/cloudinary/sign-upload", (_req, res) => {
+    const cfg = cloudinary.config();
+    const cloudName = cfg.cloud_name || process.env.CLOUDINARY_CLOUD_NAME;
+    const apiKey = cfg.api_key || process.env.CLOUDINARY_API_KEY;
+    const apiSecret = cfg.api_secret || process.env.CLOUDINARY_API_SECRET;
+
+    if (!cloudName || !apiKey || !apiSecret) {
+      return res.status(500).json({ error: "Cloudinary nao configurado no servidor" });
+    }
+
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder = "songs";
+    const publicId = `upload-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    const signature = cloudinary.utils.api_sign_request(
+      { timestamp, folder, public_id: publicId },
+      apiSecret
+    );
+
+    res.json({
+      cloudName,
+      apiKey,
+      timestamp,
+      signature,
+      folder,
+      publicId,
+      uploadUrl: `https://api.cloudinary.com/v1_1/${cloudName}/video/upload`,
+    });
+  });
+
   // Helper: pipeline completo de processamento — upload + análise + metrônomo.
   // Tudo em paralelo onde possível.
-  async function processAndUploadAudio(audioBuf: Buffer, folder: string, publicId: string) {
-    const [url, analysis] = await Promise.all([
-      uploadAudioToCloudinary(audioBuf, folder, publicId),
-      analyzeAudio(audioBuf),
-    ]);
+  async function analyzeAndGenerateMetadata(audioBuf: Buffer, publicId: string): Promise<AudioMetadata> {
+    const analysis = await analyzeAudio(audioBuf);
 
     let metronomeUrl: string | null = null;
     let bpm: number | null = null;
@@ -230,13 +275,57 @@ async function startServer() {
     }
 
     return {
-      url,
       originalKey: analysis?.key ?? null,
       originalScale: analysis?.scale ?? null,
       bpm,
       metronomeUrl,
       durationS: analysis?.durationS ?? null,
     };
+  }
+
+  // Helper: pipeline completo de processamento: upload + analise + metronomo.
+  // Usado quando a rota precisa esperar por todos os metadados antes de responder.
+  async function processAndUploadAudio(audioBuf: Buffer, folder: string, publicId: string) {
+    const [url, metadata] = await Promise.all([
+      uploadAudioToCloudinary(audioBuf, folder, publicId),
+      analyzeAndGenerateMetadata(audioBuf, publicId),
+    ]);
+
+    return { url, ...metadata };
+  }
+
+  const analysisJobs = new Map<string, AnalysisJob>();
+
+  function pruneAnalysisJobs() {
+    const maxAgeMs = 60 * 60 * 1000;
+    const now = Date.now();
+    for (const [jobId, job] of analysisJobs.entries()) {
+      if (now - job.createdAt > maxAgeMs) analysisJobs.delete(jobId);
+    }
+  }
+
+  function startAnalysisJob(audioBuf: Buffer, publicId: string): string {
+    pruneAnalysisJobs();
+    const jobId = crypto.randomUUID();
+    analysisJobs.set(jobId, { status: 'processing', createdAt: Date.now() });
+
+    void (async () => {
+      try {
+        console.log(`[analysis] job ${jobId} iniciado`);
+        const result = await analyzeAndGenerateMetadata(audioBuf, publicId);
+        analysisJobs.set(jobId, { status: 'succeeded', result, createdAt: Date.now() });
+        console.log(`[analysis] job ${jobId} concluido`);
+      } catch (e: any) {
+        console.error(`[analysis] job ${jobId} falhou:`, e);
+        analysisJobs.set(jobId, {
+          status: 'failed',
+          error: e.message || String(e),
+          createdAt: Date.now(),
+        });
+      }
+    })();
+
+    return jobId;
   }
 
   // Rota de Upload de arquivo local
@@ -249,7 +338,18 @@ async function startServer() {
 
       console.log(`Upload pro Cloudinary: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
       const publicId = `upload-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      const result = await processAndUploadAudio(file.buffer, "songs", publicId);
+      const url = await uploadAudioToCloudinary(file.buffer, "songs", publicId);
+      const analysisJobId = startAnalysisJob(file.buffer, `${publicId}-analysis`);
+      const result: { url: string; analysisJobId: string; analysisDeferred: boolean } & AudioMetadata = {
+        url,
+        analysisJobId,
+        analysisDeferred: true,
+        originalKey: null,
+        originalScale: null,
+        bpm: null,
+        metronomeUrl: null,
+        durationS: null,
+      };
       console.log(`Upload concluído: ${result.url} | tom: ${result.originalKey} ${result.originalScale} | BPM: ${result.bpm?.toFixed(1) ?? '?'}`);
       res.json(result);
     } catch (error: any) {
@@ -262,6 +362,37 @@ async function startServer() {
   // Tenta múltiplas instâncias em ordem; usa a primeira que responder com tunnel/redirect válido.
   // Lista override via env COBALT_API_URL (separe por vírgula).
   // Catálogo público (frágil, mudam toda hora): https://instances.hyper.lol/
+  app.post("/api/analyze/start", async (req, res) => {
+    try {
+      const { audioUrl } = req.body;
+      if (!audioUrl) return res.status(400).json({ error: "audioUrl obrigatorio" });
+
+      console.log(`[analysis] baixando audio para analise: ${audioUrl}`);
+      const audioRes = await fetch(audioUrl);
+      if (!audioRes.ok) {
+        return res.status(502).json({ error: `Falha ao baixar audio: HTTP ${audioRes.status}` });
+      }
+
+      const audioBuf = Buffer.from(await audioRes.arrayBuffer());
+      const urlHash = crypto.createHash('sha1').update(audioUrl).digest('hex').slice(0, 12);
+      const jobId = startAnalysisJob(audioBuf, `analysis-${urlHash}`);
+      res.json({ jobId });
+    } catch (error: any) {
+      console.error("Erro ao iniciar analise:", error);
+      res.status(500).json({ error: "Erro ao iniciar analise", details: error.message });
+    }
+  });
+
+  app.get("/api/analyze/status/:jobId", async (req, res) => {
+    const { jobId } = req.params;
+    if (!jobId) return res.status(400).json({ error: "jobId obrigatorio" });
+
+    const job = analysisJobs.get(jobId);
+    if (!job) return res.status(404).json({ error: "jobId nao encontrado" });
+
+    res.json(job);
+  });
+
   const COBALT_INSTANCES = (process.env.COBALT_API_URL ||
     'https://dwnld.nichind.dev,https://api.cobalt.tools,https://cobalt-backend.canine.tools'
   ).split(',').map(s => s.trim()).filter(Boolean);

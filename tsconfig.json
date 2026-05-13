@@ -23,5 +23,10 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "extends": "expo/tsconfig.base"
+  "extends": "expo/tsconfig.base",
+  "exclude": [
+    "src-web-backup",
+    "dist",
+    "node_modules"
+  ]
 }
