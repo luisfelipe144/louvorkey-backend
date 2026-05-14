@@ -1,0 +1,17 @@
+{
+  "name": "LouvorKey Studio",
+  "short_name": "LouvorKey",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#08110d",
+  "theme_color": "#08110d",
+  "description": "Repertório de louvor com player, mudança de tom, metrônomo e separação de faixas por IA.",
+  "icons": [
+    {
+      "src": "/icon.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -6,8 +6,12 @@
     "start": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web",
-    "backend": "tsx server.ts"
+    "expo:web": "expo start --web",
+    "web": "vite --host 0.0.0.0",
+    "build:web": "vite build",
+    "preview:web": "vite preview --host 0.0.0.0",
+    "backend": "npm run build:web && tsx server.ts",
+    "backend:dev": "tsx server.ts"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -43,12 +47,15 @@
     "tone": "^15.1.22"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "@types/react": "~19.1.0",
+    "@vitejs/plugin-react": "^6.0.1",
     "autoprefixer": "^10.4.21",
     "tailwindcss": "^3.4.19",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vite": "^8.0.13"
   }
 }

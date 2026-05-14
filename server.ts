@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
@@ -235,6 +236,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  app.use(cors({ origin: true }));
   app.use(express.json());
 
   app.get("/api/health", (_req, res) => {
@@ -668,6 +670,15 @@ async function startServer() {
   const uploadDir = path.join(__dirname, "public", "uploads");
   if (fs.existsSync(uploadDir)) {
     app.use("/uploads", express.static(uploadDir));
+  }
+
+  const webDistDir = path.join(__dirname, "dist");
+  if (fs.existsSync(webDistDir)) {
+    app.use(express.static(webDistDir));
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api/")) return next();
+      res.sendFile(path.join(webDistDir, "index.html"));
+    });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
