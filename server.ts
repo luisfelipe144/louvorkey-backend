@@ -164,7 +164,7 @@ async function pcmToMp3(pcm: Float32Array, sampleRate = 44100): Promise<Buffer> 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Cloudinary guarda os áudios (substituiu Firebase Storage que exige plano Blaze).
+// Cloudinary guarda os áudios, stems, metrônomos e versões com tom alterado.
 // Aceita tanto CLOUDINARY_URL (uma var só) quanto as 3 vars individuais.
 if (!process.env.CLOUDINARY_URL && process.env.CLOUDINARY_CLOUD_NAME) {
   process.env.CLOUDINARY_URL = `cloudinary://${process.env.CLOUDINARY_API_KEY}:${process.env.CLOUDINARY_API_SECRET}@${process.env.CLOUDINARY_CLOUD_NAME}`;
@@ -284,7 +284,7 @@ async function startServer() {
         console.log(`[metronome] gerando ${analysis.ticks.length} clicks (BPM=${analysis.bpm.toFixed(1)})...`);
         const metroPcm = buildMetronomeBuffer(analysis.ticks, analysis.durationS);
         const metroMp3 = await pcmToMp3(metroPcm);
-        metronomeUrl = await uploadAudioToCloudinary(metroMp3, 'metronomes', `${publicId}-metro`);
+        metronomeUrl = await uploadAudioToCloudinary(metroMp3, 'metronomes', `${publicId}-metronome`);
         bpm = analysis.bpm;
         console.log(`[metronome] pronto: ${metronomeUrl}`);
       } catch (e: any) {

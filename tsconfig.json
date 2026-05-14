@@ -1,8 +1,6 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "experimentalDecorators": true,
-    "useDefineForClassFields": false,
     "module": "ESNext",
     "lib": [
       "ES2022",
@@ -13,7 +11,7 @@
     "moduleResolution": "bundler",
     "isolatedModules": true,
     "moduleDetection": "force",
-    "allowJs": true,
+    "resolveJsonModule": true,
     "jsx": "react-jsx",
     "paths": {
       "@/*": [
@@ -21,12 +19,20 @@
       ]
     },
     "allowImportingTsExtensions": true,
-    "noEmit": true
+    "noEmit": true,
+    "types": [
+      "vite/client",
+      "node"
+    ]
   },
-  "extends": "expo/tsconfig.base",
+  "include": [
+    "src",
+    "server.ts",
+    "vite.config.ts"
+  ],
   "exclude": [
-    "src-web-backup",
     "dist",
-    "node_modules"
+    "node_modules",
+    "public/uploads"
   ]
 }
