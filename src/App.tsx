@@ -153,7 +153,7 @@ function readableError(message: string) {
   }
 
   if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies|youtube bloqueou|anti-rob[oô]/i.test(text)) {
-    return 'YouTube bloqueou o servidor com verificacao anti-robo. Anexe um cookies.txt do YouTube na aba YouTube e tente novamente.';
+    return 'O YouTube bloqueou o acesso direto. O servidor vai tentar fontes alternativas; se continuar falhando, tente novamente em alguns minutos ou envie o arquivo de audio.';
   }
 
   text = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -184,23 +184,6 @@ async function readJsonResponse<T>(response: Response): Promise<T> {
   return data as T;
 }
 
-function textToBase64(text: string) {
-  const bytes = new TextEncoder().encode(text);
-  let binary = '';
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
-  return btoa(binary);
-}
-
-function readStoredValue(key: string) {
-  try {
-    return localStorage.getItem(key) || '';
-  } catch {
-    return '';
-  }
-}
-
 export default function App() {
   const [songs, setSongs] = useState<Song[]>([]);
   const [selectedSong, setSelectedSong] = useState<Song | null>(null);
@@ -210,8 +193,6 @@ export default function App() {
   const [newTitle, setNewTitle] = useState('');
   const [newAuthor, setNewAuthor] = useState('');
   const [newYoutubeUrl, setNewYoutubeUrl] = useState('');
-  const [youtubeCookiesBase64, setYoutubeCookiesBase64] = useState(() => readStoredValue('louvorkey.youtubeCookiesBase64'));
-  const [youtubeCookiesName, setYoutubeCookiesName] = useState(() => readStoredValue('louvorkey.youtubeCookiesName'));
   const [newFile, setNewFile] = useState<File | null>(null);
   const [busyLabel, setBusyLabel] = useState('');
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -536,51 +517,6 @@ export default function App() {
     }
   }
 
-  async function handleYoutubeCookiesFile(file?: File | null) {
-    if (!file) return;
-
-    try {
-      if (file.size > 560_000) {
-        throw new Error('Arquivo cookies.txt muito grande. Exporte apenas os cookies do youtube.com.');
-      }
-
-      const text = await file.text();
-      if (!/youtube\.com/i.test(text)) {
-        throw new Error('Esse arquivo nao parece conter cookies do YouTube.');
-      }
-
-      const encoded = textToBase64(text);
-      if (encoded.length > 740_000) {
-        throw new Error('Arquivo cookies.txt muito grande para enviar. Exporte apenas os cookies do youtube.com.');
-      }
-
-      setYoutubeCookiesBase64(encoded);
-      setYoutubeCookiesName(file.name || 'cookies.txt');
-      try {
-        localStorage.setItem('louvorkey.youtubeCookiesBase64', encoded);
-        localStorage.setItem('louvorkey.youtubeCookiesName', file.name || 'cookies.txt');
-      } catch {
-        // Se o navegador bloquear localStorage, mantemos em memoria nesta sessao.
-      }
-
-      setNotice({ type: 'success', message: 'Cookies do YouTube salvos neste navegador. Agora tente salvar a musica pelo link.' });
-    } catch (error) {
-      setNotice({ type: 'error', message: `Cookies do YouTube invalidos: ${safeError(error)}` });
-    }
-  }
-
-  function clearYoutubeCookies() {
-    setYoutubeCookiesBase64('');
-    setYoutubeCookiesName('');
-    try {
-      localStorage.removeItem('louvorkey.youtubeCookiesBase64');
-      localStorage.removeItem('louvorkey.youtubeCookiesName');
-    } catch {
-      // Nada a limpar quando localStorage nao estiver disponivel.
-    }
-    setNotice({ type: 'info', message: 'Cookies do YouTube removidos deste navegador.' });
-  }
-
   async function addSong(event: React.FormEvent) {
     event.preventDefault();
     if (!newTitle.trim() || !newAuthor.trim()) {
@@ -632,10 +568,7 @@ export default function App() {
         const response = await fetch(`${API_URL}/api/youtube`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: newYoutubeUrl.trim(),
-            cookiesBase64: youtubeCookiesBase64 || undefined,
-          }),
+          body: JSON.stringify({ url: newYoutubeUrl.trim() }),
         });
         const data = await readJsonResponse<Partial<Song> & { url: string; analysisJobId?: string | null }>(response);
         audioUrl = data.url;
@@ -1081,49 +1014,14 @@ export default function App() {
                 />
               </label>
             ) : (
-              <>
-                <label className="field">
-                  <span>Link do YouTube</span>
-                  <input
-                    value={newYoutubeUrl}
-                    onChange={(event) => setNewYoutubeUrl(event.target.value)}
-                    placeholder="https://youtube.com/watch?v=..."
-                  />
-                </label>
-
-                <div className="cookies-card">
-                  <div className="cookies-copy">
-                    <UploadCloud size={18} />
-                    <div>
-                      <strong>Cookies do YouTube</strong>
-                      <small>
-                        {youtubeCookiesName
-                          ? `Usando ${youtubeCookiesName}`
-                          : 'Opcional: anexe quando o YouTube bloquear o servidor.'}
-                      </small>
-                    </div>
-                  </div>
-                  <div className="cookies-actions">
-                    <label className="mini-file-button">
-                      {youtubeCookiesName ? 'Trocar' : 'Anexar cookies.txt'}
-                      <input
-                        type="file"
-                        accept=".txt,text/plain"
-                        disabled={!!busyLabel}
-                        onChange={(event) => {
-                          void handleYoutubeCookiesFile(event.target.files?.[0] || null);
-                          event.currentTarget.value = '';
-                        }}
-                      />
-                    </label>
-                    {youtubeCookiesName && (
-                      <button type="button" className="text-button" onClick={clearYoutubeCookies} disabled={!!busyLabel}>
-                        Remover
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </>
+              <label className="field">
+                <span>Link do YouTube</span>
+                <input
+                  value={newYoutubeUrl}
+                  onChange={(event) => setNewYoutubeUrl(event.target.value)}
+                  placeholder="https://youtube.com/watch?v=..."
+                />
+              </label>
             )}
 
             <button className="submit-button" type="submit" disabled={!!busyLabel}>

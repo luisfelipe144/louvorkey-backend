@@ -23,7 +23,6 @@ const require = createRequire(import.meta.url);
 const ytDlpPackage = require("yt-dlp-exec") as any;
 const ytDlpConstants = require("yt-dlp-exec/src/constants") as { YOUTUBE_DL_PATH: string };
 let ytDlpRunnerPromise: Promise<any> | null = null;
-let ytDlpCookiesPathPromise: Promise<string | null> | null = null;
 let ytDlpPotSetupPromise: Promise<void> | null = null;
 const YTDLP_ROOT = process.env.YTDLP_ROOT || path.join(__dirname, '.yt-dlp');
 const YTDLP_PLUGIN_DIR = process.env.YTDLP_PLUGIN_DIR || path.join(YTDLP_ROOT, 'plugins');
@@ -32,6 +31,7 @@ const YTDLP_BGUTIL_SERVER_HOME = process.env.YTDLP_BGUTIL_SERVER_HOME ||
 const YTDLP_USER_AGENT = process.env.YTDLP_USER_AGENT ||
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15';
 const YTDLP_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=mweb,web_safari';
+const YTDLP_PROXY_URL = process.env.YTDLP_PROXY_URL || '';
 
 function getYtDlpDownloadUrl() {
   if (process.platform === 'win32') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
@@ -95,34 +95,8 @@ async function ensureYtDlpPotProvider() {
   return ytDlpPotSetupPromise;
 }
 
-async function getYtDlpCookiesPath(requestCookiesBase64?: string | null) {
-  if (requestCookiesBase64) {
-    const cookiesPath = path.join(os.tmpdir(), `louvorkey-youtube-cookies-${crypto.randomUUID()}.txt`);
-    const cookies = Buffer.from(requestCookiesBase64, 'base64').toString('utf8');
-    if (!cookies.includes('youtube.com') && !cookies.includes('.youtube.com')) {
-      throw new Error('Arquivo cookies.txt nao parece conter cookies do YouTube');
-    }
-    await fs.promises.writeFile(cookiesPath, cookies, 'utf8');
-    return cookiesPath;
-  }
-
-  if (process.env.YTDLP_COOKIES_PATH) return process.env.YTDLP_COOKIES_PATH;
-  if (!process.env.YTDLP_COOKIES_BASE64) return null;
-  if (ytDlpCookiesPathPromise) return ytDlpCookiesPathPromise;
-
-  ytDlpCookiesPathPromise = (async () => {
-    const cookiesPath = path.join(os.tmpdir(), 'louvorkey-youtube-cookies.txt');
-    const cookies = Buffer.from(process.env.YTDLP_COOKIES_BASE64 || '', 'base64').toString('utf8');
-    await fs.promises.writeFile(cookiesPath, cookies, 'utf8');
-    return cookiesPath;
-  })();
-
-  return ytDlpCookiesPathPromise;
-}
-
-async function getYtDlpCommonFlags(requestCookiesBase64?: string | null) {
+async function getYtDlpCommonFlags() {
   await ensureYtDlpPotProvider();
-  const cookiesPath = await getYtDlpCookiesPath(requestCookiesBase64);
   const potArgs = process.env.YTDLP_DISABLE_POT_PROVIDER === '1'
     ? ''
     : `youtubepot-bgutilscript:server_home=${YTDLP_BGUTIL_SERVER_HOME}`;
@@ -135,7 +109,7 @@ async function getYtDlpCommonFlags(requestCookiesBase64?: string | null) {
     jsRuntimes: `node:${process.execPath}`,
   };
   if (fs.existsSync(YTDLP_PLUGIN_DIR)) flags.pluginDirs = YTDLP_PLUGIN_DIR;
-  if (cookiesPath) flags.cookies = cookiesPath;
+  if (YTDLP_PROXY_URL) flags.proxy = YTDLP_PROXY_URL;
   return flags;
 }
 
@@ -280,6 +254,27 @@ async function pcmToMp3(pcm: Float32Array, sampleRate = 44100): Promise<Buffer> 
   } finally {
     fs.promises.unlink(tmpPcm).catch(() => {});
     fs.promises.unlink(tmpMp3).catch(() => {});
+  }
+}
+
+async function transcodeAudioToMp3(audioBuffer: Buffer, inputExt = 'bin'): Promise<Buffer> {
+  const uid = crypto.randomUUID();
+  const tmpIn = path.join(os.tmpdir(), `audio-in-${uid}.${inputExt.replace(/[^a-z0-9]/gi, '') || 'bin'}`);
+  const tmpOut = path.join(os.tmpdir(), `audio-out-${uid}.mp3`);
+  await fs.promises.writeFile(tmpIn, audioBuffer);
+  try {
+    await execFileAsync(FFMPEG_PATH, [
+      '-y',
+      '-i', tmpIn,
+      '-vn',
+      '-c:a', 'libmp3lame',
+      '-b:a', '192k',
+      tmpOut,
+    ], { maxBuffer: 160 * 1024 * 1024 });
+    return await fs.promises.readFile(tmpOut);
+  } finally {
+    fs.promises.unlink(tmpIn).catch(() => {});
+    fs.promises.unlink(tmpOut).catch(() => {});
   }
 }
 
@@ -522,13 +517,17 @@ async function startServer() {
   const COBALT_INSTANCES = (process.env.COBALT_API_URL ||
     'https://dwnld.nichind.dev,https://api.cobalt.tools,https://cobalt-backend.canine.tools'
   ).split(',').map(s => s.trim()).filter(Boolean);
+  const COBALT_API_KEY = process.env.COBALT_API_KEY || '';
+  const PIPED_INSTANCES = (process.env.PIPED_API_URLS ||
+    'https://api.piped.private.coffee,https://pipedapi.tokhmi.xyz,https://yapi.vyper.me,https://api.piped.projectsegfau.lt'
+  ).split(',').map(s => s.trim()).filter(Boolean);
 
   function cleanExternalError(text: string) {
     const trimmed = String(text || '').trim();
     if (!trimmed) return 'sem detalhes';
     if (/^<!doctype|^<html/i.test(trimmed)) return 'resposta HTML inesperada do servico externo';
     if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies|youtube bloqueou|anti-rob[oô]/i.test(trimmed)) {
-      return 'YouTube bloqueou o servidor do Render com verificacao anti-robo. Anexe um cookies.txt do YouTube na aba YouTube e tente novamente.';
+      return 'YouTube bloqueou o acesso direto do servidor. Tentando fontes alternativas sem cookies.';
     }
     return trimmed.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 260);
   }
@@ -561,22 +560,23 @@ async function startServer() {
     return `https://www.youtube.com/watch?v=${match[0]}`;
   }
 
-  async function fetchFromYtDlp(
-    youtubeUrl: string,
-    cookiesBase64?: string | null
-  ): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  function getYouTubeVideoId(rawUrl: string) {
+    const normalizedUrl = normalizeYouTubeUrl(rawUrl);
+    const parsed = new URL(normalizedUrl);
+    const videoId = parsed.searchParams.get('v');
+    if (!videoId) throw new Error("Nao encontrei o ID do video neste link do YouTube");
+    return videoId;
+  }
+
+  async function fetchFromYtDlp(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
     const uid = crypto.randomUUID();
     const outputTemplate = path.join(os.tmpdir(), `yt-${uid}.%(ext)s`);
     const outputPrefix = `yt-${uid}.`;
     let title: string | undefined;
-    let requestCookiesPath: string | null = null;
 
     try {
       const ytDlp = await getYtDlpRunner();
-      const commonFlags = await getYtDlpCommonFlags(cookiesBase64);
-      requestCookiesPath = cookiesBase64 && typeof commonFlags.cookies === 'string'
-        ? commonFlags.cookies
-        : null;
+      const commonFlags = await getYtDlpCommonFlags();
 
       try {
         const info = await ytDlp(youtubeUrl, {
@@ -621,22 +621,117 @@ async function startServer() {
       await Promise.all(files
         .filter((file) => file.startsWith(outputPrefix))
         .map((file) => fs.promises.unlink(path.join(os.tmpdir(), file)).catch(() => {})));
-      if (requestCookiesPath) {
-        await fs.promises.unlink(requestCookiesPath).catch(() => {});
-      }
     }
   }
 
-  async function fetchFromCobalt(
-    youtubeUrl: string,
-    cookiesBase64?: string | null
-  ): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  function getAudioExtFromPiped(stream: any) {
+    const format = String(stream?.format || '').toLowerCase();
+    const mime = String(stream?.mimeType || stream?.type || '').toLowerCase();
+    if (format.includes('m4a') || mime.includes('mp4')) return 'm4a';
+    if (format.includes('opus') || format.includes('webm') || mime.includes('webm')) return 'webm';
+    if (format.includes('mp3') || mime.includes('mpeg')) return 'mp3';
+    return 'bin';
+  }
+
+  function safeSongFilename(title?: string) {
+    const clean = String(title || 'Audio do YouTube')
+      .replace(/[\\/:*?"<>|]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120);
+    return `${clean || 'Audio do YouTube'}.mp3`;
+  }
+
+  async function fetchFromPiped(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+    const videoId = getYouTubeVideoId(youtubeUrl);
+    const attempts: string[] = [];
+
+    for (const instance of PIPED_INSTANCES) {
+      try {
+        console.log(`[Piped] tentando ${instance}`);
+        const streamsRes = await fetch(`${instance.replace(/\/$/, '')}/streams/${videoId}`, {
+          headers: { 'Accept': 'application/json' },
+          // @ts-ignore
+          signal: AbortSignal.timeout(20000),
+        });
+
+        if (!streamsRes.ok) {
+          attempts.push(`${instance} -> HTTP ${streamsRes.status}`);
+          continue;
+        }
+
+        const streams: any = await streamsRes.json();
+        const audioStreams = Array.isArray(streams.audioStreams) ? streams.audioStreams : [];
+        const candidates = audioStreams
+          .filter((stream: any) => stream?.url)
+          .sort((a: any, b: any) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
+        const best = candidates.find((stream: any) => /m4a|mp4/i.test(`${stream.format || ''} ${stream.mimeType || ''}`))
+          || candidates[0];
+
+        if (!best?.url) {
+          attempts.push(`${instance} -> sem stream de audio`);
+          continue;
+        }
+
+        console.log(`[Piped] baixando stream ${best.format || best.mimeType || 'audio'} (${best.quality || best.bitrate || 'qualidade desconhecida'})`);
+        const audioRes = await fetch(best.url, {
+          headers: {
+            'User-Agent': YTDLP_USER_AGENT,
+            'Referer': instance,
+          },
+          // @ts-ignore
+          signal: AbortSignal.timeout(120000),
+        });
+
+        if (!audioRes.ok) {
+          attempts.push(`${instance} stream -> HTTP ${audioRes.status}`);
+          continue;
+        }
+
+        const rawBuffer = Buffer.from(await audioRes.arrayBuffer());
+        if (rawBuffer.byteLength < 64 * 1024) {
+          attempts.push(`${instance} -> audio muito pequeno (${rawBuffer.byteLength}B)`);
+          continue;
+        }
+
+        const inputExt = getAudioExtFromPiped(best);
+        const audioBuffer = inputExt === 'mp3'
+          ? rawBuffer
+          : await transcodeAudioToMp3(rawBuffer, inputExt);
+
+        if (audioBuffer.byteLength < 64 * 1024) {
+          attempts.push(`${instance} -> mp3 muito pequeno (${audioBuffer.byteLength}B)`);
+          continue;
+        }
+
+        return {
+          audioBuffer,
+          filename: safeSongFilename(streams.title),
+          source: `piped:${new URL(instance).hostname}`,
+        };
+      } catch (e: any) {
+        attempts.push(`${instance} -> ${cleanExternalError(e.message || String(e))}`);
+      }
+    }
+
+    throw new Error(`Piped nao conseguiu obter o audio. Tentativas:\n${attempts.join('\n')}`);
+  }
+
+  async function fetchFromCobalt(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
     const normalizedUrl = normalizeYouTubeUrl(youtubeUrl);
     const attempts: string[] = [];
 
     try {
+      console.log('[Piped] tentando baixar audio por proxy publico...');
+      return await fetchFromPiped(normalizedUrl);
+    } catch (e: any) {
+      attempts.push(`Piped -> ${cleanExternalError(e.message || String(e))}`);
+      console.warn('[Piped] falhou, tentando yt-dlp...');
+    }
+
+    try {
       console.log('[yt-dlp] tentando baixar audio...');
-      return await fetchFromYtDlp(normalizedUrl, cookiesBase64);
+      return await fetchFromYtDlp(normalizedUrl);
     } catch (e: any) {
       attempts.push(`yt-dlp -> ${cleanExternalError(e.stderr || e.message || String(e))}`);
       console.warn('[yt-dlp] falhou, tentando Cobalt...');
@@ -645,14 +740,26 @@ async function startServer() {
     for (const instance of COBALT_INSTANCES) {
       try {
         console.log(`[Cobalt] tentando ${instance}`);
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        };
+        if (COBALT_API_KEY) {
+          headers.Authorization = COBALT_API_KEY.match(/^(Api-Key|Bearer)\s/i)
+            ? COBALT_API_KEY
+            : `Api-Key ${COBALT_API_KEY}`;
+        }
         const cobaltRes = await fetch(instance, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          headers,
           body: JSON.stringify({
             url: normalizedUrl,
             downloadMode: 'audio',
             audioFormat: 'mp3',
+            audioBitrate: '320',
             filenameStyle: 'basic',
+            youtubeBetterAudio: true,
+            alwaysProxy: true,
           }),
           // @ts-ignore — undici aceita signal mas não declarado em todos os types
           signal: AbortSignal.timeout(20000),
@@ -694,18 +801,12 @@ async function startServer() {
 
   app.post("/api/youtube", async (req, res) => {
     try {
-      const { url, cookiesBase64 } = req.body;
+      const { url } = req.body;
       if (!url) {
         return res.status(400).json({ error: "URL do YouTube inválida ou não fornecida" });
       }
-      const requestCookiesBase64 = typeof cookiesBase64 === 'string' && cookiesBase64.trim()
-        ? cookiesBase64.trim()
-        : null;
-      if (requestCookiesBase64 && requestCookiesBase64.length > 750000) {
-        return res.status(400).json({ error: "cookiesBase64 muito grande" });
-      }
 
-      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url, requestCookiesBase64);
+      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url);
       const audioBuf = Buffer.from(audioBuffer);
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;

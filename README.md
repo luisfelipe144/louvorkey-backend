@@ -21,5 +21,5 @@ Site responsivo para repertório de louvor com player web, upload de músicas, m
 ## Importar do YouTube
 
 - Cole o link na aba YouTube e salve normalmente.
-- Se o YouTube bloquear o servidor com verificação anti-robô, anexe um `cookies.txt` exportado do domínio `youtube.com` no próprio modal. O site guarda esse arquivo apenas no navegador e o backend apaga o arquivo temporário depois do download.
-- Também é possível configurar `YTDLP_COOKIES_BASE64` no servidor para usar cookies fixos em produção.
+- O backend tenta primeiro fontes alternativas via Piped, depois yt-dlp e Cobalt.
+- Para produção mais estável, configure um proxy pago em `YTDLP_PROXY_URL` ou uma instância/chave própria de Cobalt em `COBALT_API_URL` e `COBALT_API_KEY`.
