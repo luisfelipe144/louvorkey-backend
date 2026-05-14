@@ -18,7 +18,39 @@ import "dotenv/config";
 const execFileAsync = promisify(execFile);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
 const require = createRequire(import.meta.url);
-const ytDlp = require("yt-dlp-exec") as any;
+const ytDlpPackage = require("yt-dlp-exec") as any;
+const ytDlpConstants = require("yt-dlp-exec/src/constants") as { YOUTUBE_DL_PATH: string };
+let ytDlpRunnerPromise: Promise<any> | null = null;
+
+function getYtDlpDownloadUrl() {
+  if (process.platform === 'win32') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+  if (process.platform === 'darwin') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos';
+  return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+}
+
+async function getYtDlpRunner() {
+  if (fs.existsSync(ytDlpConstants.YOUTUBE_DL_PATH)) return ytDlpPackage;
+  if (ytDlpRunnerPromise) return ytDlpRunnerPromise;
+
+  ytDlpRunnerPromise = (async () => {
+    const extension = process.platform === 'win32' ? '.exe' : '';
+    const targetPath = path.join(os.tmpdir(), `louvorkey-yt-dlp-${process.platform}${extension}`);
+
+    if (!fs.existsSync(targetPath)) {
+      const downloadUrl = getYtDlpDownloadUrl();
+      console.warn(`[yt-dlp] binario ausente, baixando ${downloadUrl}`);
+      const response = await fetch(downloadUrl);
+      if (!response.ok) throw new Error(`Falha ao baixar yt-dlp: HTTP ${response.status}`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      await fs.promises.writeFile(targetPath, buffer);
+      if (process.platform !== 'win32') await fs.promises.chmod(targetPath, 0o755);
+    }
+
+    return ytDlpPackage.create(targetPath);
+  })();
+
+  return ytDlpRunnerPromise;
+}
 
 // essentia.js carrega via WASM. Inicializamos uma vez e reusamos.
 const { Essentia, EssentiaWASM } = EssentiaPkg as any;
@@ -449,6 +481,8 @@ async function startServer() {
     let title: string | undefined;
 
     try {
+      const ytDlp = await getYtDlpRunner();
+
       try {
         const info = await ytDlp(youtubeUrl, {
           dumpSingleJson: true,
