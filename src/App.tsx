@@ -152,7 +152,7 @@ function readableError(message: string) {
     return 'O servidor retornou uma página HTML inesperada. Recarregue o site e tente novamente.';
   }
 
-  if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies/i.test(text)) {
+  if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies|youtube bloqueou|anti-rob[oô]/i.test(text)) {
     return 'YouTube bloqueou o servidor com verificacao anti-robo. Anexe um cookies.txt do YouTube na aba YouTube e tente novamente.';
   }
 

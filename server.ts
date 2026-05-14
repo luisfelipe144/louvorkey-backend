@@ -527,7 +527,7 @@ async function startServer() {
     const trimmed = String(text || '').trim();
     if (!trimmed) return 'sem detalhes';
     if (/^<!doctype|^<html/i.test(trimmed)) return 'resposta HTML inesperada do servico externo';
-    if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies/i.test(trimmed)) {
+    if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies|youtube bloqueou|anti-rob[oô]/i.test(trimmed)) {
       return 'YouTube bloqueou o servidor do Render com verificacao anti-robo. Anexe um cookies.txt do YouTube na aba YouTube e tente novamente.';
     }
     return trimmed.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 260);
