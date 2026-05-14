@@ -152,6 +152,10 @@ function readableError(message: string) {
     return 'O servidor retornou uma página HTML inesperada. Recarregue o site e tente novamente.';
   }
 
+  if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies/i.test(text)) {
+    return 'YouTube bloqueou o servidor com verificação anti-robô. Por enquanto, envie a música pela opção Arquivo ou configure cookies do YouTube no servidor.';
+  }
+
   text = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   return text.length > 420 ? `${text.slice(0, 420)}...` : text;
 }
