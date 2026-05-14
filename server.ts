@@ -95,7 +95,17 @@ async function ensureYtDlpPotProvider() {
   return ytDlpPotSetupPromise;
 }
 
-async function getYtDlpCookiesPath() {
+async function getYtDlpCookiesPath(requestCookiesBase64?: string | null) {
+  if (requestCookiesBase64) {
+    const cookiesPath = path.join(os.tmpdir(), `louvorkey-youtube-cookies-${crypto.randomUUID()}.txt`);
+    const cookies = Buffer.from(requestCookiesBase64, 'base64').toString('utf8');
+    if (!cookies.includes('youtube.com') && !cookies.includes('.youtube.com')) {
+      throw new Error('Arquivo cookies.txt nao parece conter cookies do YouTube');
+    }
+    await fs.promises.writeFile(cookiesPath, cookies, 'utf8');
+    return cookiesPath;
+  }
+
   if (process.env.YTDLP_COOKIES_PATH) return process.env.YTDLP_COOKIES_PATH;
   if (!process.env.YTDLP_COOKIES_BASE64) return null;
   if (ytDlpCookiesPathPromise) return ytDlpCookiesPathPromise;
@@ -110,9 +120,9 @@ async function getYtDlpCookiesPath() {
   return ytDlpCookiesPathPromise;
 }
 
-async function getYtDlpCommonFlags() {
+async function getYtDlpCommonFlags(requestCookiesBase64?: string | null) {
   await ensureYtDlpPotProvider();
-  const cookiesPath = await getYtDlpCookiesPath();
+  const cookiesPath = await getYtDlpCookiesPath(requestCookiesBase64);
   const potArgs = process.env.YTDLP_DISABLE_POT_PROVIDER === '1'
     ? ''
     : `youtubepot-bgutilscript:server_home=${YTDLP_BGUTIL_SERVER_HOME}`;
@@ -346,7 +356,7 @@ async function startServer() {
   const PORT = 3000;
 
   app.use(cors({ origin: true }));
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb' }));
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true, service: "louvorkey-backend" });
@@ -518,7 +528,7 @@ async function startServer() {
     if (!trimmed) return 'sem detalhes';
     if (/^<!doctype|^<html/i.test(trimmed)) return 'resposta HTML inesperada do servico externo';
     if (/sign in to confirm.*not a bot|cookies-from-browser|--cookies/i.test(trimmed)) {
-      return 'YouTube bloqueou o servidor do Render com verificacao anti-robo. Use upload de arquivo ou configure YTDLP_COOKIES_BASE64 no Render para liberar importacao por link.';
+      return 'YouTube bloqueou o servidor do Render com verificacao anti-robo. Anexe um cookies.txt do YouTube na aba YouTube e tente novamente.';
     }
     return trimmed.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 260);
   }
@@ -551,15 +561,22 @@ async function startServer() {
     return `https://www.youtube.com/watch?v=${match[0]}`;
   }
 
-  async function fetchFromYtDlp(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  async function fetchFromYtDlp(
+    youtubeUrl: string,
+    cookiesBase64?: string | null
+  ): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
     const uid = crypto.randomUUID();
     const outputTemplate = path.join(os.tmpdir(), `yt-${uid}.%(ext)s`);
     const outputPrefix = `yt-${uid}.`;
     let title: string | undefined;
+    let requestCookiesPath: string | null = null;
 
     try {
       const ytDlp = await getYtDlpRunner();
-      const commonFlags = await getYtDlpCommonFlags();
+      const commonFlags = await getYtDlpCommonFlags(cookiesBase64);
+      requestCookiesPath = cookiesBase64 && typeof commonFlags.cookies === 'string'
+        ? commonFlags.cookies
+        : null;
 
       try {
         const info = await ytDlp(youtubeUrl, {
@@ -604,16 +621,22 @@ async function startServer() {
       await Promise.all(files
         .filter((file) => file.startsWith(outputPrefix))
         .map((file) => fs.promises.unlink(path.join(os.tmpdir(), file)).catch(() => {})));
+      if (requestCookiesPath) {
+        await fs.promises.unlink(requestCookiesPath).catch(() => {});
+      }
     }
   }
 
-  async function fetchFromCobalt(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  async function fetchFromCobalt(
+    youtubeUrl: string,
+    cookiesBase64?: string | null
+  ): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
     const normalizedUrl = normalizeYouTubeUrl(youtubeUrl);
     const attempts: string[] = [];
 
     try {
       console.log('[yt-dlp] tentando baixar audio...');
-      return await fetchFromYtDlp(normalizedUrl);
+      return await fetchFromYtDlp(normalizedUrl, cookiesBase64);
     } catch (e: any) {
       attempts.push(`yt-dlp -> ${cleanExternalError(e.stderr || e.message || String(e))}`);
       console.warn('[yt-dlp] falhou, tentando Cobalt...');
@@ -671,12 +694,18 @@ async function startServer() {
 
   app.post("/api/youtube", async (req, res) => {
     try {
-      const { url } = req.body;
+      const { url, cookiesBase64 } = req.body;
       if (!url) {
         return res.status(400).json({ error: "URL do YouTube inválida ou não fornecida" });
       }
+      const requestCookiesBase64 = typeof cookiesBase64 === 'string' && cookiesBase64.trim()
+        ? cookiesBase64.trim()
+        : null;
+      if (requestCookiesBase64 && requestCookiesBase64.length > 750000) {
+        return res.status(400).json({ error: "cookiesBase64 muito grande" });
+      }
 
-      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url);
+      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url, requestCookiesBase64);
       const audioBuf = Buffer.from(audioBuffer);
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;

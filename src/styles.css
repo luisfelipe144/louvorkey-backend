@@ -761,6 +761,78 @@ input[type='range']::-webkit-slider-thumb {
   cursor: pointer;
 }
 
+.cookies-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid rgba(12, 107, 68, 0.16);
+  border-radius: 22px;
+  background: rgba(12, 107, 68, 0.055);
+}
+
+.cookies-copy {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  color: var(--green-strong);
+}
+
+.cookies-copy strong,
+.cookies-copy small {
+  display: block;
+}
+
+.cookies-copy strong {
+  color: var(--ink);
+  font-weight: 950;
+}
+
+.cookies-copy small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.cookies-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.mini-file-button,
+.text-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 14px;
+  font-size: 0.84rem;
+  font-weight: 950;
+}
+
+.mini-file-button {
+  overflow: hidden;
+  color: #fff8ed;
+  background: var(--green);
+  cursor: pointer;
+}
+
+.mini-file-button input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.text-button {
+  color: var(--green-strong);
+  background: rgba(12, 107, 68, 0.1);
+}
+
 .submit-button {
   width: 100%;
   min-height: 62px;
