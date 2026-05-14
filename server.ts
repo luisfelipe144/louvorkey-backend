@@ -21,6 +21,10 @@ const require = createRequire(import.meta.url);
 const ytDlpPackage = require("yt-dlp-exec") as any;
 const ytDlpConstants = require("yt-dlp-exec/src/constants") as { YOUTUBE_DL_PATH: string };
 let ytDlpRunnerPromise: Promise<any> | null = null;
+let ytDlpCookiesPathPromise: Promise<string | null> | null = null;
+const YTDLP_USER_AGENT = process.env.YTDLP_USER_AGENT ||
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15';
+const YTDLP_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=web_safari';
 
 function getYtDlpDownloadUrl() {
   if (process.platform === 'win32') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
@@ -50,6 +54,34 @@ async function getYtDlpRunner() {
   })();
 
   return ytDlpRunnerPromise;
+}
+
+async function getYtDlpCookiesPath() {
+  if (process.env.YTDLP_COOKIES_PATH) return process.env.YTDLP_COOKIES_PATH;
+  if (!process.env.YTDLP_COOKIES_BASE64) return null;
+  if (ytDlpCookiesPathPromise) return ytDlpCookiesPathPromise;
+
+  ytDlpCookiesPathPromise = (async () => {
+    const cookiesPath = path.join(os.tmpdir(), 'louvorkey-youtube-cookies.txt');
+    const cookies = Buffer.from(process.env.YTDLP_COOKIES_BASE64 || '', 'base64').toString('utf8');
+    await fs.promises.writeFile(cookiesPath, cookies, 'utf8');
+    return cookiesPath;
+  })();
+
+  return ytDlpCookiesPathPromise;
+}
+
+async function getYtDlpCommonFlags() {
+  const cookiesPath = await getYtDlpCookiesPath();
+  const flags: Record<string, unknown> = {
+    noWarnings: true,
+    noPlaylist: true,
+    userAgent: YTDLP_USER_AGENT,
+    referer: 'https://www.youtube.com/',
+    extractorArgs: YTDLP_EXTRACTOR_ARGS,
+  };
+  if (cookiesPath) flags.cookies = cookiesPath;
+  return flags;
 }
 
 // essentia.js carrega via WASM. Inicializamos uma vez e reusamos.
@@ -482,12 +514,12 @@ async function startServer() {
 
     try {
       const ytDlp = await getYtDlpRunner();
+      const commonFlags = await getYtDlpCommonFlags();
 
       try {
         const info = await ytDlp(youtubeUrl, {
+          ...commonFlags,
           dumpSingleJson: true,
-          noWarnings: true,
-          noPlaylist: true,
           skipDownload: true,
         }, { timeout: 45000 });
         title = info?.title;
@@ -496,6 +528,7 @@ async function startServer() {
       }
 
       await ytDlp.exec(youtubeUrl, {
+        ...commonFlags,
         noPlaylist: true,
         format: 'bestaudio/best',
         extractAudio: true,
