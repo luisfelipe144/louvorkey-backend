@@ -15,6 +15,8 @@ import ffmpegStatic from "ffmpeg-static";
 import EssentiaPkg from "essentia.js";
 import "dotenv/config";
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
 const require = createRequire(import.meta.url);
@@ -22,9 +24,14 @@ const ytDlpPackage = require("yt-dlp-exec") as any;
 const ytDlpConstants = require("yt-dlp-exec/src/constants") as { YOUTUBE_DL_PATH: string };
 let ytDlpRunnerPromise: Promise<any> | null = null;
 let ytDlpCookiesPathPromise: Promise<string | null> | null = null;
+let ytDlpPotSetupPromise: Promise<void> | null = null;
+const YTDLP_ROOT = process.env.YTDLP_ROOT || path.join(__dirname, '.yt-dlp');
+const YTDLP_PLUGIN_DIR = process.env.YTDLP_PLUGIN_DIR || path.join(YTDLP_ROOT, 'plugins');
+const YTDLP_BGUTIL_SERVER_HOME = process.env.YTDLP_BGUTIL_SERVER_HOME ||
+  path.join(YTDLP_ROOT, 'bgutil-ytdlp-pot-provider', 'server');
 const YTDLP_USER_AGENT = process.env.YTDLP_USER_AGENT ||
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15';
-const YTDLP_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=web_safari';
+const YTDLP_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=mweb,web_safari';
 
 function getYtDlpDownloadUrl() {
   if (process.platform === 'win32') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
@@ -56,6 +63,38 @@ async function getYtDlpRunner() {
   return ytDlpRunnerPromise;
 }
 
+async function ensureYtDlpPotProvider() {
+  if (process.env.YTDLP_DISABLE_POT_PROVIDER === '1') return;
+  const pluginZip = path.join(YTDLP_PLUGIN_DIR, 'bgutil-ytdlp-pot-provider.zip');
+  const providerBuild = path.join(YTDLP_BGUTIL_SERVER_HOME, 'build', 'generate_once.js');
+  if (fs.existsSync(pluginZip) && fs.existsSync(providerBuild)) return;
+  if (ytDlpPotSetupPromise) return ytDlpPotSetupPromise;
+
+  ytDlpPotSetupPromise = (async () => {
+    const setupScript = path.join(__dirname, 'scripts', 'setup-ytdlp-pot.mjs');
+    if (!fs.existsSync(setupScript)) {
+      console.warn('[yt-dlp-pot] script de setup nao encontrado; seguindo sem PO Token provider');
+      return;
+    }
+
+    console.warn('[yt-dlp-pot] provider ausente; executando setup em runtime');
+    await execFileAsync(process.execPath, [setupScript], {
+      cwd: __dirname,
+      maxBuffer: 50 * 1024 * 1024,
+      env: {
+        ...process.env,
+        YTDLP_ROOT,
+        YTDLP_PLUGIN_DIR,
+        YTDLP_BGUTIL_SERVER_HOME,
+      },
+    });
+  })().catch((error) => {
+    console.warn('[yt-dlp-pot] setup em runtime falhou:', error.message || String(error));
+  });
+
+  return ytDlpPotSetupPromise;
+}
+
 async function getYtDlpCookiesPath() {
   if (process.env.YTDLP_COOKIES_PATH) return process.env.YTDLP_COOKIES_PATH;
   if (!process.env.YTDLP_COOKIES_BASE64) return null;
@@ -72,14 +111,20 @@ async function getYtDlpCookiesPath() {
 }
 
 async function getYtDlpCommonFlags() {
+  await ensureYtDlpPotProvider();
   const cookiesPath = await getYtDlpCookiesPath();
+  const potArgs = process.env.YTDLP_DISABLE_POT_PROVIDER === '1'
+    ? ''
+    : `youtubepot-bgutilscript:server_home=${YTDLP_BGUTIL_SERVER_HOME}`;
   const flags: Record<string, unknown> = {
     noWarnings: true,
     noPlaylist: true,
     userAgent: YTDLP_USER_AGENT,
     referer: 'https://www.youtube.com/',
-    extractorArgs: YTDLP_EXTRACTOR_ARGS,
+    extractorArgs: [YTDLP_EXTRACTOR_ARGS, potArgs].filter(Boolean),
+    jsRuntimes: `node:${process.execPath}`,
   };
+  if (fs.existsSync(YTDLP_PLUGIN_DIR)) flags.pluginDirs = YTDLP_PLUGIN_DIR;
   if (cookiesPath) flags.cookies = cookiesPath;
   return flags;
 }
@@ -227,9 +272,6 @@ async function pcmToMp3(pcm: Float32Array, sampleRate = 44100): Promise<Buffer> 
     fs.promises.unlink(tmpMp3).catch(() => {});
   }
 }
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // Cloudinary guarda os áudios, stems, metrônomos e versões com tom alterado.
 // Aceita tanto CLOUDINARY_URL (uma var só) quanto as 3 vars individuais.

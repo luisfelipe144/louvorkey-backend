@@ -11,7 +11,8 @@
     "preview": "vite preview --host 0.0.0.0",
     "preview:web": "vite preview --host 0.0.0.0",
     "backend": "npm run build:web && tsx server.ts",
-    "backend:dev": "tsx server.ts"
+    "backend:dev": "tsx server.ts",
+    "postinstall": "node scripts/setup-ytdlp-pot.mjs"
   },
   "dependencies": {
     "cloudinary": "^2.10.0",
