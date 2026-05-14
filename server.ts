@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import multer from "multer";
 import fs from "fs";
 import os from "os";
@@ -16,6 +17,8 @@ import "dotenv/config";
 
 const execFileAsync = promisify(execFile);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
+const require = createRequire(import.meta.url);
+const ytDlp = require("yt-dlp-exec") as any;
 
 // essentia.js carrega via WASM. Inicializamos uma vez e reusamos.
 const { Essentia, EssentiaWASM } = EssentiaPkg as any;
@@ -301,17 +304,6 @@ async function startServer() {
     };
   }
 
-  // Helper: pipeline completo de processamento: upload + analise + metronomo.
-  // Usado quando a rota precisa esperar por todos os metadados antes de responder.
-  async function processAndUploadAudio(audioBuf: Buffer, folder: string, publicId: string) {
-    const [url, metadata] = await Promise.all([
-      uploadAudioToCloudinary(audioBuf, folder, publicId),
-      analyzeAndGenerateMetadata(audioBuf, publicId),
-    ]);
-
-    return { url, ...metadata };
-  }
-
   const analysisJobs = new Map<string, AnalysisJob>();
 
   function pruneAnalysisJobs() {
@@ -415,8 +407,106 @@ async function startServer() {
     'https://dwnld.nichind.dev,https://api.cobalt.tools,https://cobalt-backend.canine.tools'
   ).split(',').map(s => s.trim()).filter(Boolean);
 
-  async function fetchFromCobalt(youtubeUrl: string): Promise<{ audioBuffer: ArrayBuffer; filename?: string }> {
+  function cleanExternalError(text: string) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return 'sem detalhes';
+    if (/^<!doctype|^<html/i.test(trimmed)) return 'resposta HTML inesperada do servico externo';
+    return trimmed.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').slice(0, 260);
+  }
+
+  function normalizeYouTubeUrl(rawUrl: string) {
+    const trimmed = String(rawUrl || '').trim();
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new Error("URL do YouTube invalida");
+    }
+
+    const host = parsed.hostname.replace(/^www\./, '').toLowerCase();
+    let videoId = '';
+
+    if (host === 'youtu.be') {
+      videoId = parsed.pathname.split('/').filter(Boolean)[0] || '';
+    } else if (host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com')) {
+      videoId = parsed.searchParams.get('v') || '';
+      if (!videoId) {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        const marker = parts.findIndex((part) => ['shorts', 'live', 'embed'].includes(part));
+        if (marker >= 0) videoId = parts[marker + 1] || '';
+      }
+    }
+
+    const match = videoId.match(/^[a-zA-Z0-9_-]{6,}$/);
+    if (!match) throw new Error("Nao encontrei o ID do video neste link do YouTube");
+    return `https://www.youtube.com/watch?v=${match[0]}`;
+  }
+
+  async function fetchFromYtDlp(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+    const uid = crypto.randomUUID();
+    const outputTemplate = path.join(os.tmpdir(), `yt-${uid}.%(ext)s`);
+    const outputPrefix = `yt-${uid}.`;
+    let title: string | undefined;
+
+    try {
+      try {
+        const info = await ytDlp(youtubeUrl, {
+          dumpSingleJson: true,
+          noWarnings: true,
+          noPlaylist: true,
+          skipDownload: true,
+        }, { timeout: 45000 });
+        title = info?.title;
+      } catch (metadataError: any) {
+        console.warn("[yt-dlp] metadados indisponiveis:", metadataError.message || String(metadataError));
+      }
+
+      await ytDlp.exec(youtubeUrl, {
+        noPlaylist: true,
+        format: 'bestaudio/best',
+        extractAudio: true,
+        audioFormat: 'mp3',
+        audioQuality: 0,
+        output: outputTemplate,
+        ffmpegLocation: FFMPEG_PATH,
+        noWarnings: true,
+      }, { timeout: 180000 });
+
+      const files = (await fs.promises.readdir(os.tmpdir()))
+        .filter((file) => file.startsWith(outputPrefix));
+      const mp3File = files.find((file) => file.endsWith('.mp3')) || files[0];
+      if (!mp3File) throw new Error("yt-dlp nao gerou arquivo de audio");
+
+      const audioBuffer = await fs.promises.readFile(path.join(os.tmpdir(), mp3File));
+      if (audioBuffer.byteLength < 1024) {
+        throw new Error(`yt-dlp gerou audio muito pequeno (${audioBuffer.byteLength}B)`);
+      }
+
+      return {
+        audioBuffer,
+        filename: title ? `${title}.mp3` : mp3File,
+        source: 'yt-dlp',
+      };
+    } finally {
+      const files = await fs.promises.readdir(os.tmpdir()).catch(() => []);
+      await Promise.all(files
+        .filter((file) => file.startsWith(outputPrefix))
+        .map((file) => fs.promises.unlink(path.join(os.tmpdir(), file)).catch(() => {})));
+    }
+  }
+
+  async function fetchFromCobalt(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+    const normalizedUrl = normalizeYouTubeUrl(youtubeUrl);
     const attempts: string[] = [];
+
+    try {
+      console.log('[yt-dlp] tentando baixar audio...');
+      return await fetchFromYtDlp(normalizedUrl);
+    } catch (e: any) {
+      attempts.push(`yt-dlp -> ${cleanExternalError(e.stderr || e.message || String(e))}`);
+      console.warn('[yt-dlp] falhou, tentando Cobalt...');
+    }
+
     for (const instance of COBALT_INSTANCES) {
       try {
         console.log(`[Cobalt] tentando ${instance}`);
@@ -424,7 +514,7 @@ async function startServer() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify({
-            url: youtubeUrl,
+            url: normalizedUrl,
             downloadMode: 'audio',
             audioFormat: 'mp3',
             filenameStyle: 'basic',
@@ -434,8 +524,8 @@ async function startServer() {
         });
 
         if (!cobaltRes.ok) {
-          const errText = (await cobaltRes.text()).slice(0, 200);
-          attempts.push(`${instance} -> HTTP ${cobaltRes.status}: ${errText}`);
+          const errText = await cobaltRes.text();
+          attempts.push(`${instance} -> HTTP ${cobaltRes.status}: ${cleanExternalError(errText)}`);
           continue;
         }
 
@@ -459,12 +549,12 @@ async function startServer() {
           attempts.push(`${instance} -> resposta muito pequena (${audioBuffer.byteLength}B)`);
           continue;
         }
-        return { audioBuffer, filename: cobaltData.filename };
+        return { audioBuffer: Buffer.from(audioBuffer), filename: cobaltData.filename, source: 'cobalt' };
       } catch (e: any) {
         attempts.push(`${instance} -> ${e.message || String(e)}`);
       }
     }
-    throw new Error(`Todas as instâncias Cobalt falharam:\n${attempts.join('\n')}`);
+    throw new Error(`Nao consegui baixar este video do YouTube. Tentativas:\n${attempts.join('\n')}`);
   }
 
   app.post("/api/youtube", async (req, res) => {
@@ -474,21 +564,29 @@ async function startServer() {
         return res.status(400).json({ error: "URL do YouTube inválida ou não fornecida" });
       }
 
-      const { audioBuffer, filename: cobaltFilename } = await fetchFromCobalt(url);
+      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url);
       const audioBuf = Buffer.from(audioBuffer);
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
-      const result = await processAndUploadAudio(audioBuf, "songs", publicId);
-      console.log(`YouTube concluído: ${result.url} | tom: ${result.originalKey} | BPM: ${result.bpm?.toFixed(1) ?? '?'}`);
+      console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB, source=${source})`);
+      const uploadedUrl = await uploadAudioToCloudinary(audioBuf, "songs", publicId);
+      const analysisJobId = startAnalysisJob(audioBuf, `${publicId}-analysis`);
+      console.log(`YouTube enviado: ${uploadedUrl} | analise em segundo plano: ${analysisJobId}`);
 
       res.json({
-        ...result,
-        title: cobaltFilename || "Áudio do YouTube",
+        url: uploadedUrl,
+        title: youtubeFilename || "Áudio do YouTube",
+        analysisJobId,
+        analysisDeferred: true,
+        originalKey: null,
+        originalScale: null,
+        bpm: null,
+        metronomeUrl: null,
+        durationS: null,
       });
     } catch (error: any) {
       console.error("Erro no download do YouTube:", error);
-      res.status(500).json({ error: "Falha ao processar o vídeo do YouTube.", details: error.message });
+      res.status(502).json({ error: "Falha ao processar o vídeo do YouTube.", details: cleanExternalError(error.message) });
     }
   });
 

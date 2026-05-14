@@ -133,7 +133,51 @@ function formatTime(seconds: number) {
 }
 
 function safeError(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
+  return readableError(error instanceof Error ? error.message : String(error));
+}
+
+function readableError(message: string) {
+  let text = String(message || '').trim();
+
+  if (text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text);
+      text = parsed.details || parsed.error || parsed.message || text;
+    } catch {
+      // Mantem o texto original quando nao for JSON valido.
+    }
+  }
+
+  if (/^<!doctype|^<html/i.test(text)) {
+    return 'O servidor retornou uma página HTML inesperada. Recarregue o site e tente novamente.';
+  }
+
+  text = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  return text.length > 420 ? `${text.slice(0, 420)}...` : text;
+}
+
+async function readJsonResponse<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  let data: unknown = null;
+
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+
+  if (!response.ok) {
+    if (data && typeof data === 'object') {
+      const payload = data as { error?: string; details?: string; message?: string };
+      throw new Error(readableError(payload.details || payload.error || payload.message || text));
+    }
+    throw new Error(readableError(text || `HTTP ${response.status}`));
+  }
+
+  if (!data) throw new Error('Resposta inválida do servidor.');
+  return data as T;
 }
 
 export default function App() {
@@ -480,6 +524,7 @@ export default function App() {
 
     try {
       let audioUrl = '';
+      let analysisJobId: string | null = null;
       let metadata: Partial<Song> = {};
 
       if (addMode === 'local') {
@@ -490,9 +535,14 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: newFile.name }),
         });
-        const signText = await signResponse.text();
-        if (!signResponse.ok) throw new Error(signText || `HTTP ${signResponse.status}`);
-        const signed = JSON.parse(signText);
+        const signed = await readJsonResponse<{
+          apiKey: string;
+          timestamp: number;
+          signature: string;
+          folder: string;
+          publicId: string;
+          uploadUrl: string;
+        }>(signResponse);
 
         setBusyLabel('Enviando áudio para Cloudinary...');
         const formData = new FormData();
@@ -507,9 +557,7 @@ export default function App() {
           method: 'POST',
           body: formData,
         });
-        const uploadText = await uploadResponse.text();
-        if (!uploadResponse.ok) throw new Error(uploadText || `HTTP ${uploadResponse.status}`);
-        const uploadData = JSON.parse(uploadText);
+        const uploadData = await readJsonResponse<{ secure_url: string }>(uploadResponse);
         audioUrl = uploadData.secure_url;
       } else {
         if (!newYoutubeUrl.trim()) throw new Error('Cole o link do YouTube.');
@@ -518,10 +566,9 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: newYoutubeUrl.trim() }),
         });
-        const text = await response.text();
-        if (!response.ok) throw new Error(text || `HTTP ${response.status}`);
-        const data = JSON.parse(text);
+        const data = await readJsonResponse<Partial<Song> & { url: string; analysisJobId?: string | null }>(response);
         audioUrl = data.url;
+        analysisJobId = data.analysisJobId || null;
         metadata = {
           originalKey: data.originalKey ?? null,
           originalScale: data.originalScale ?? null,
@@ -545,7 +592,9 @@ export default function App() {
         createdAt: serverTimestamp(),
       });
 
-      if (addMode === 'local') {
+      if (analysisJobId) {
+        void pollAnalysisJob(songRef.id, analysisJobId, audioUrl);
+      } else if (addMode === 'local') {
         void pollAnalysisJob(songRef.id, null, audioUrl);
       }
 
