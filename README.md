@@ -21,5 +21,5 @@ Site responsivo para repertório de louvor com player web, upload de músicas, m
 ## Importar do YouTube
 
 - Cole o link na aba YouTube e salve normalmente.
-- O backend tenta primeiro fontes alternativas via Piped, depois yt-dlp e Cobalt.
+- O backend tenta fontes alternativas via Piped em paralelo e corta tentativas lentas para a tela nao ficar presa por varios minutos.
 - Para produção mais estável, configure um proxy pago em `YTDLP_PROXY_URL` ou uma instância/chave própria de Cobalt em `COBALT_API_URL` e `COBALT_API_KEY`.

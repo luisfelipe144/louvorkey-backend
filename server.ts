@@ -33,6 +33,22 @@ const YTDLP_USER_AGENT = process.env.YTDLP_USER_AGENT ||
 const YTDLP_EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || 'youtube:player_client=mweb,web_safari';
 const YTDLP_PROXY_URL = process.env.YTDLP_PROXY_URL || '';
 
+function envNumber(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+const YOUTUBE_IMPORT_TIMEOUT_MS = envNumber('YOUTUBE_IMPORT_TIMEOUT_MS', 120000);
+const PIPED_METADATA_TIMEOUT_MS = envNumber('PIPED_METADATA_TIMEOUT_MS', 8000);
+const PIPED_AUDIO_TIMEOUT_MS = envNumber('PIPED_AUDIO_TIMEOUT_MS', 45000);
+const PIPED_PARALLEL_DOWNLOADS = envNumber('PIPED_PARALLEL_DOWNLOADS', 2);
+const YTDLP_METADATA_TIMEOUT_MS = envNumber('YTDLP_METADATA_TIMEOUT_MS', 10000);
+const YTDLP_DOWNLOAD_TIMEOUT_MS = envNumber('YTDLP_DOWNLOAD_TIMEOUT_MS', 55000);
+const COBALT_API_TIMEOUT_MS = envNumber('COBALT_API_TIMEOUT_MS', 10000);
+const COBALT_DOWNLOAD_TIMEOUT_MS = envNumber('COBALT_DOWNLOAD_TIMEOUT_MS', 35000);
+const CLOUDINARY_UPLOAD_TIMEOUT_MS = envNumber('CLOUDINARY_UPLOAD_TIMEOUT_MS', 90000);
+const YOUTUBE_ENABLE_SLOW_FALLBACKS = process.env.YOUTUBE_ENABLE_SLOW_FALLBACKS === '1';
+
 function getYtDlpDownloadUrl() {
   if (process.platform === 'win32') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
   if (process.platform === 'darwin') return 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos';
@@ -293,6 +309,8 @@ async function uploadAudioToCloudinary(
   format = "mp3"
 ): Promise<string> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let stream: ReturnType<typeof cloudinary.uploader.upload_stream>;
     const opts: any = {
       resource_type: "video",
       folder,
@@ -300,10 +318,23 @@ async function uploadAudioToCloudinary(
     };
     if (publicId) opts.public_id = publicId;
 
-    const stream = cloudinary.uploader.upload_stream(opts, (error, result) => {
-      if (error) return reject(error);
-      if (!result?.secure_url) return reject(new Error("Cloudinary não retornou secure_url"));
-      resolve(result.secure_url);
+    function finish(error?: unknown, url?: string) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else if (url) resolve(url);
+      else reject(new Error("Cloudinary nao retornou secure_url"));
+    }
+
+    const timeout = setTimeout(() => {
+      stream?.destroy(new Error("Timeout no upload para Cloudinary"));
+      finish(new Error("Timeout no upload para Cloudinary"));
+    }, CLOUDINARY_UPLOAD_TIMEOUT_MS);
+
+    stream = cloudinary.uploader.upload_stream(opts, (error, result) => {
+      if (error) return finish(error);
+      finish(undefined, result?.secure_url);
     });
     stream.end(Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer));
   });
@@ -323,6 +354,19 @@ type AnalysisJob = {
   result?: AudioMetadata;
   error?: string;
   createdAt: number;
+};
+
+type DownloadedAudio = {
+  audioBuffer: Buffer;
+  filename?: string;
+  source: string;
+  format?: string;
+};
+
+type PipedCandidate = {
+  instance: string;
+  streams: any;
+  stream: any;
 };
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -568,7 +612,7 @@ async function startServer() {
     return videoId;
   }
 
-  async function fetchFromYtDlp(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  async function fetchFromYtDlp(youtubeUrl: string): Promise<DownloadedAudio> {
     const uid = crypto.randomUUID();
     const outputTemplate = path.join(os.tmpdir(), `yt-${uid}.%(ext)s`);
     const outputPrefix = `yt-${uid}.`;
@@ -583,7 +627,7 @@ async function startServer() {
           ...commonFlags,
           dumpSingleJson: true,
           skipDownload: true,
-        }, { timeout: 45000 });
+        }, { timeout: YTDLP_METADATA_TIMEOUT_MS });
         title = info?.title;
       } catch (metadataError: any) {
         console.warn("[yt-dlp] metadados indisponiveis:", metadataError.message || String(metadataError));
@@ -599,7 +643,7 @@ async function startServer() {
         output: outputTemplate,
         ffmpegLocation: FFMPEG_PATH,
         noWarnings: true,
-      }, { timeout: 180000 });
+      }, { timeout: YTDLP_DOWNLOAD_TIMEOUT_MS });
 
       const files = (await fs.promises.readdir(os.tmpdir()))
         .filter((file) => file.startsWith(outputPrefix));
@@ -633,91 +677,112 @@ async function startServer() {
     return 'bin';
   }
 
-  function safeSongFilename(title?: string) {
+  function safeSongFilename(title?: string, ext = 'mp3') {
     const clean = String(title || 'Audio do YouTube')
       .replace(/[\\/:*?"<>|]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 120);
-    return `${clean || 'Audio do YouTube'}.mp3`;
+    return `${clean || 'Audio do YouTube'}.${ext.replace(/[^a-z0-9]/gi, '') || 'mp3'}`;
   }
 
-  async function fetchFromPiped(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
-    const videoId = getYouTubeVideoId(youtubeUrl);
-    const attempts: string[] = [];
+  async function getPipedCandidate(instance: string, videoId: string): Promise<PipedCandidate> {
+    const streamsRes = await fetch(`${instance.replace(/\/$/, '')}/streams/${videoId}`, {
+      headers: { 'Accept': 'application/json' },
+      // @ts-ignore
+      signal: AbortSignal.timeout(PIPED_METADATA_TIMEOUT_MS),
+    });
 
-    for (const instance of PIPED_INSTANCES) {
-      try {
-        console.log(`[Piped] tentando ${instance}`);
-        const streamsRes = await fetch(`${instance.replace(/\/$/, '')}/streams/${videoId}`, {
-          headers: { 'Accept': 'application/json' },
-          // @ts-ignore
-          signal: AbortSignal.timeout(20000),
-        });
-
-        if (!streamsRes.ok) {
-          attempts.push(`${instance} -> HTTP ${streamsRes.status}`);
-          continue;
-        }
-
-        const streams: any = await streamsRes.json();
-        const audioStreams = Array.isArray(streams.audioStreams) ? streams.audioStreams : [];
-        const candidates = audioStreams
-          .filter((stream: any) => stream?.url)
-          .sort((a: any, b: any) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
-        const best = candidates.find((stream: any) => /m4a|mp4/i.test(`${stream.format || ''} ${stream.mimeType || ''}`))
-          || candidates[0];
-
-        if (!best?.url) {
-          attempts.push(`${instance} -> sem stream de audio`);
-          continue;
-        }
-
-        console.log(`[Piped] baixando stream ${best.format || best.mimeType || 'audio'} (${best.quality || best.bitrate || 'qualidade desconhecida'})`);
-        const audioRes = await fetch(best.url, {
-          headers: {
-            'User-Agent': YTDLP_USER_AGENT,
-            'Referer': instance,
-          },
-          // @ts-ignore
-          signal: AbortSignal.timeout(120000),
-        });
-
-        if (!audioRes.ok) {
-          attempts.push(`${instance} stream -> HTTP ${audioRes.status}`);
-          continue;
-        }
-
-        const rawBuffer = Buffer.from(await audioRes.arrayBuffer());
-        if (rawBuffer.byteLength < 64 * 1024) {
-          attempts.push(`${instance} -> audio muito pequeno (${rawBuffer.byteLength}B)`);
-          continue;
-        }
-
-        const inputExt = getAudioExtFromPiped(best);
-        const audioBuffer = inputExt === 'mp3'
-          ? rawBuffer
-          : await transcodeAudioToMp3(rawBuffer, inputExt);
-
-        if (audioBuffer.byteLength < 64 * 1024) {
-          attempts.push(`${instance} -> mp3 muito pequeno (${audioBuffer.byteLength}B)`);
-          continue;
-        }
-
-        return {
-          audioBuffer,
-          filename: safeSongFilename(streams.title),
-          source: `piped:${new URL(instance).hostname}`,
-        };
-      } catch (e: any) {
-        attempts.push(`${instance} -> ${cleanExternalError(e.message || String(e))}`);
-      }
+    if (!streamsRes.ok) {
+      throw new Error(`HTTP ${streamsRes.status}`);
     }
 
-    throw new Error(`Piped nao conseguiu obter o audio. Tentativas:\n${attempts.join('\n')}`);
+    const streams: any = await streamsRes.json();
+    const audioStreams = Array.isArray(streams.audioStreams) ? streams.audioStreams : [];
+    const candidates = audioStreams
+      .filter((stream: any) => stream?.url)
+      .sort((a: any, b: any) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
+    const stream = candidates.find((item: any) => /m4a|mp4/i.test(`${item.format || ''} ${item.mimeType || ''}`))
+      || candidates[0];
+
+    if (!stream?.url) {
+      throw new Error('sem stream de audio');
+    }
+
+    return { instance, streams, stream };
   }
 
-  async function fetchFromCobalt(youtubeUrl: string): Promise<{ audioBuffer: Buffer; filename?: string; source: string }> {
+  async function downloadPipedCandidate(candidate: PipedCandidate): Promise<DownloadedAudio> {
+    const { instance, streams, stream } = candidate;
+    console.log(`[Piped] baixando stream ${stream.format || stream.mimeType || 'audio'} (${stream.quality || stream.bitrate || 'qualidade desconhecida'}) de ${instance}`);
+    const audioRes = await fetch(stream.url, {
+      headers: {
+        'User-Agent': YTDLP_USER_AGENT,
+        'Referer': instance,
+      },
+      // @ts-ignore
+      signal: AbortSignal.timeout(PIPED_AUDIO_TIMEOUT_MS),
+    });
+
+    if (!audioRes.ok) {
+      throw new Error(`stream HTTP ${audioRes.status}`);
+    }
+
+    const rawBuffer = Buffer.from(await audioRes.arrayBuffer());
+    if (rawBuffer.byteLength < 64 * 1024) {
+      throw new Error(`audio muito pequeno (${rawBuffer.byteLength}B)`);
+    }
+
+    const inputExt = getAudioExtFromPiped(stream);
+    const canKeepOriginal = inputExt === 'm4a' || inputExt === 'mp3';
+    const audioBuffer = canKeepOriginal
+      ? rawBuffer
+      : await transcodeAudioToMp3(rawBuffer, inputExt);
+    const outputFormat = canKeepOriginal ? inputExt : 'mp3';
+
+    if (audioBuffer.byteLength < 64 * 1024) {
+      throw new Error(`audio final muito pequeno (${audioBuffer.byteLength}B)`);
+    }
+
+    return {
+      audioBuffer,
+      filename: safeSongFilename(streams.title, outputFormat),
+      source: `piped:${new URL(instance).hostname}`,
+      format: outputFormat,
+    };
+  }
+
+  async function fetchFromPiped(youtubeUrl: string): Promise<DownloadedAudio> {
+    const videoId = getYouTubeVideoId(youtubeUrl);
+    console.log(`[Piped] buscando streams em ${PIPED_INSTANCES.length} instancias`);
+    const metadataResults = await Promise.allSettled(
+      PIPED_INSTANCES.map((instance) => getPipedCandidate(instance, videoId))
+    );
+
+    const candidates = metadataResults
+      .filter((result): result is PromiseFulfilledResult<PipedCandidate> => result.status === 'fulfilled')
+      .map((result) => result.value);
+    if (!candidates.length) {
+      const attempts = metadataResults
+        .map((result, index) => `${PIPED_INSTANCES[index]} -> ${result.status === 'rejected' ? cleanExternalError(result.reason?.message || String(result.reason)) : 'sem audio'}`)
+        .join('\n');
+      throw new Error(`Piped nao encontrou stream de audio. Tentativas:\n${attempts}`);
+    }
+
+    const downloadCandidates = candidates.slice(0, Math.max(1, PIPED_PARALLEL_DOWNLOADS));
+    const downloads = downloadCandidates.map(downloadPipedCandidate);
+    try {
+      return await Promise.any(downloads);
+    } catch {
+      const downloadResults = await Promise.allSettled(downloads);
+      const attempts = downloadResults
+        .map((result, index) => `${downloadCandidates[index].instance} -> ${result.status === 'rejected' ? cleanExternalError(result.reason?.message || String(result.reason)) : 'sem audio'}`)
+        .join('\n');
+      throw new Error(`Piped nao conseguiu baixar o audio. Tentativas:\n${attempts}`);
+    }
+  }
+
+  async function fetchFromCobalt(youtubeUrl: string): Promise<DownloadedAudio> {
     const normalizedUrl = normalizeYouTubeUrl(youtubeUrl);
     const attempts: string[] = [];
 
@@ -726,7 +791,11 @@ async function startServer() {
       return await fetchFromPiped(normalizedUrl);
     } catch (e: any) {
       attempts.push(`Piped -> ${cleanExternalError(e.message || String(e))}`);
-      console.warn('[Piped] falhou, tentando yt-dlp...');
+      console.warn('[Piped] falhou');
+    }
+
+    if (!YOUTUBE_ENABLE_SLOW_FALLBACKS && !YTDLP_PROXY_URL && !COBALT_API_KEY) {
+      throw new Error(`Nao consegui baixar rapido pelo proxy Piped. Tentativas:\n${attempts.join('\n')}`);
     }
 
     try {
@@ -762,7 +831,7 @@ async function startServer() {
             alwaysProxy: true,
           }),
           // @ts-ignore — undici aceita signal mas não declarado em todos os types
-          signal: AbortSignal.timeout(20000),
+          signal: AbortSignal.timeout(COBALT_API_TIMEOUT_MS),
         });
 
         if (!cobaltRes.ok) {
@@ -780,7 +849,7 @@ async function startServer() {
         console.log(`[Cobalt] ${instance} retornou status=${cobaltData.status}, baixando...`);
         const audioRes = await fetch(cobaltData.url, {
           // @ts-ignore
-          signal: AbortSignal.timeout(60000),
+          signal: AbortSignal.timeout(COBALT_DOWNLOAD_TIMEOUT_MS),
         });
         if (!audioRes.ok) {
           attempts.push(`${instance} tunnel -> HTTP ${audioRes.status}`);
@@ -806,12 +875,13 @@ async function startServer() {
         return res.status(400).json({ error: "URL do YouTube inválida ou não fornecida" });
       }
 
-      const { audioBuffer, filename: youtubeFilename, source } = await fetchFromCobalt(url);
+      const { audioBuffer, filename: youtubeFilename, source, format } = await fetchFromCobalt(url);
       const audioBuf = Buffer.from(audioBuffer);
+      const uploadFormat = format || 'mp3';
 
       const publicId = `youtube-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-      console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB, source=${source})`);
-      const uploadedUrl = await uploadAudioToCloudinary(audioBuf, "songs", publicId);
+      console.log(`Upload pro Cloudinary: ${publicId} (${(audioBuffer.byteLength / 1024 / 1024).toFixed(2)} MB, source=${source}, format=${uploadFormat})`);
+      const uploadedUrl = await uploadAudioToCloudinary(audioBuf, "songs", publicId, uploadFormat);
       const analysisJobId = startAnalysisJob(audioBuf, `${publicId}-analysis`);
       console.log(`YouTube enviado: ${uploadedUrl} | analise em segundo plano: ${analysisJobId}`);
 

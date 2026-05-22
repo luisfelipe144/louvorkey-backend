@@ -38,6 +38,7 @@ import { db } from './firebase';
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://louvorkey-backend.onrender.com';
 const COVER_URL = 'https://images.unsplash.com/photo-1470225620780-dba8ba36b745?w=600&h=600&fit=crop';
+const YOUTUBE_REQUEST_TIMEOUT_MS = 150000;
 
 const STEM_ORDER = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
 const STEM_LABELS: Record<string, string> = {
@@ -565,11 +566,15 @@ export default function App() {
         audioUrl = uploadData.secure_url;
       } else {
         if (!newYoutubeUrl.trim()) throw new Error('Cole o link do YouTube.');
+        setBusyLabel('Buscando audio pelo link...');
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), YOUTUBE_REQUEST_TIMEOUT_MS);
         const response = await fetch(`${API_URL}/api/youtube`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: newYoutubeUrl.trim() }),
-        });
+          signal: controller.signal,
+        }).finally(() => window.clearTimeout(timeout));
         const data = await readJsonResponse<Partial<Song> & { url: string; analysisJobId?: string | null }>(response);
         audioUrl = data.url;
         analysisJobId = data.analysisJobId || null;
@@ -609,7 +614,10 @@ export default function App() {
       setNewFile(null);
       setNotice({ type: 'success', message: 'Música adicionada. Tom, BPM e metrônomo serão refinados em segundo plano.' });
     } catch (error) {
-      setNotice({ type: 'error', message: `Falha ao adicionar música: ${safeError(error)}` });
+      const message = error instanceof DOMException && error.name === 'AbortError'
+        ? 'Tempo limite ao importar pelo YouTube. Tente novamente ou envie o arquivo de audio.'
+        : safeError(error);
+      setNotice({ type: 'error', message: `Falha ao adicionar música: ${message}` });
     } finally {
       setBusyLabel('');
     }
